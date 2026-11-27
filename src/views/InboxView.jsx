@@ -9,7 +9,8 @@ import {
   Plus,
   Search,
   ShieldCheck,
-  Clock
+  Clock,
+  Paperclip
 } from 'lucide-react'
 import {
   fetchGmailMessages,
@@ -24,7 +25,8 @@ export default function InboxView({
   gmailConnected,
   onGmailStatusChange,
   showToast,
-  onTaskCreated
+  onTaskCreated,
+  onMessagesUpdated
 }) {
   const [messages, setMessages] = useState([])
   const [loading, setLoading] = useState(false)
@@ -58,6 +60,7 @@ export default function InboxView({
       } else {
         const msgs = data.messages || []
         setMessages(msgs)
+        if (onMessagesUpdated) onMessagesUpdated(msgs)
         setNextPageToken(data.nextPageToken || null)
         setCurrentPageToken(token)
 
@@ -150,7 +153,8 @@ export default function InboxView({
       (m.subject && m.subject.toLowerCase().includes(q)) ||
       (m.senderName && m.senderName.toLowerCase().includes(q)) ||
       (m.snippet && m.snippet.toLowerCase().includes(q)) ||
-      (m.from && m.from.toLowerCase().includes(q))
+      (m.from && m.from.toLowerCase().includes(q)) ||
+      (m.date && m.date.toLowerCase().includes(q))
     )
   })
 
@@ -415,7 +419,7 @@ export default function InboxView({
                       </span>
                       <span>•</span>
                       <span className="font-mono text-[11px] text-[#6B7280]">
-                        {selectedMessageDetail.from}
+                        {selectedMessageDetail.senderEmail || selectedMessageDetail.from}
                       </span>
                     </div>
                   </div>
@@ -450,6 +454,31 @@ export default function InboxView({
                 <div className="max-w-2xl text-xs text-[#242424] leading-relaxed whitespace-pre-wrap font-sans selection:bg-[#B9CDE7]">
                   {selectedMessageDetail.body || selectedMessageDetail.snippet || '(No message body available)'}
                 </div>
+
+                {/* Attachments (Read-Only metadata inspection, no auto-download) */}
+                {selectedMessageDetail.attachments && selectedMessageDetail.attachments.length > 0 && (
+                  <div className="mt-6 pt-4 border-t border-[#DEDAD0] space-y-2">
+                    <div className="text-[11px] font-semibold text-[#242424] flex items-center gap-1.5">
+                      <Paperclip className="h-3.5 w-3.5 text-[#6B7280]" />
+                      <span>Attachments ({selectedMessageDetail.attachments.length})</span>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {selectedMessageDetail.attachments.map((att, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-center gap-2 rounded-lg border border-[#DEDAD0] bg-[#F7F4EB] px-2.5 py-1 text-xs text-[#242424]"
+                          title={`${att.filename} (${att.mimeType})`}
+                        >
+                          <Paperclip className="h-3 w-3 text-[#6B7280] shrink-0" />
+                          <span className="font-medium truncate max-w-[180px]">{att.filename}</span>
+                          <span className="text-[10px] text-[#9CA3AF] font-mono shrink-0">
+                            {att.size ? `${Math.round(att.size / 1024)} KB` : ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Security Boundary Guardrail Footer */}

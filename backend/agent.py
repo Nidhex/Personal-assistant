@@ -23,11 +23,13 @@ ALLOWED_TOOLS = [
 
     # WRITE & ACTION OPERATIONS
     "create_task",
+    "create_multiple_tasks",
     "update_task",
     "complete_task",
     "reopen_task",
     "schedule_event",
     "update_calendar_event",
+    "delete_calendar_event",
     "extract_email_tasks",
     "process_youtube_notes",
     "create_revision_plan",
@@ -82,7 +84,14 @@ def parse_relative_date(date_str: str) -> str:
     if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str.strip()):
         return date_str.strip()
 
-    # Parse Month Day (e.g. 'December 15', 'Dec 15')
+    # Parse Full Date with Year (e.g. '30 November 2026', 'Nov 30, 2026')
+    for fmt in ("%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y", "%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).date().isoformat()
+        except ValueError:
+            pass
+
+    # Parse Month Day without Year (e.g. 'December 15', 'Dec 15')
     for fmt in ("%B %d", "%b %d", "%d %B", "%d %b"):
         try:
             parsed = datetime.strptime(date_str.strip(), fmt)
@@ -436,8 +445,9 @@ A **calendar conflict** occurs when a newly requested event overlaps in time wit
 """
 
     # Intent 1: Tasks - List tasks
-    if any(k in lower_prompt for k in ["show my tasks", "list tasks", "show my pending tasks", "what tasks are overdue", "what do i need to complete today"]):
+    if any(k in lower_prompt for k in ["show my tasks", "list tasks", "show my pending tasks", "what tasks are overdue", "what do i need to complete today", "show the tasks"]):
         flt = "all"
+        ws_filter = None
         if "pending" in lower_prompt or "need to complete" in lower_prompt:
             flt = "pending"
         elif "overdue" in lower_prompt:
@@ -446,17 +456,38 @@ A **calendar conflict** occurs when a newly requested event overlaps in time wit
             flt = "today"
         elif "completed" in lower_prompt:
             flt = "completed"
+
+        m_ws = re.search(r"in\s+(?:my\s+)?([a-zA-Z0-9_\s-]+?)\s+workspace", prompt, re.I)
+        if m_ws:
+            ws_filter = m_ws.group(1).strip()
+
         return json.dumps({
-            "response": f"Retrieving your {flt} tasks.",
+            "response": f"Retrieving your {flt} tasks" + (f" in workspace '{ws_filter}'" if ws_filter else "") + ".",
             "action": {
                 "tool": "list_tasks",
-                "parameters": {"filter": flt}
+                "parameters": {"filter": flt, "workspace_name": ws_filter}
             }
         })
 
+    # Intent: Tasks - Change deadline / update task
+    if any(k in lower_prompt for k in ["change the deadline", "change deadline", "reschedule task", "update deadline", "set deadline"]):
+        m = re.search(r"(?:change the deadline of|change deadline of|update deadline for|reschedule)\s+(?:my\s+)?(.+?)\s+to\s+(.+)", prompt, re.I)
+        if m:
+            title_search = m.group(1).strip()
+            due_target = m.group(2).strip().rstrip(".")
+            return json.dumps({
+                "response": f"Updating the deadline of '{title_search}' to {due_target}.",
+                "action": {
+                    "tool": "update_task",
+                    "parameters": {"title_search": title_search, "due_date": due_target}
+                }
+            })
+
     # Intent 2: Tasks - Complete / Reopen task
     if "mark" in lower_prompt and "completed" in lower_prompt or lower_prompt.startswith("complete task"):
-        title_search = prompt.replace("mark", "").replace("as completed", "").replace("complete task", "").strip()
+        title_search = re.sub(r"^(please\s+)?mark\s+(my\s+)?", "", prompt, flags=re.I)
+        title_search = re.sub(r"\s+as\s+completed\.?$", "", title_search, flags=re.I).strip()
+        title_search = re.sub(r"^complete task\s+", "", title_search, flags=re.I).strip().rstrip(".")
         return json.dumps({
             "response": f"Updating task status for '{title_search}'.",
             "action": {
@@ -475,17 +506,40 @@ A **calendar conflict** occurs when a newly requested event overlaps in time wit
             }
         })
 
+    # Intent: Tasks - Create multiple tasks
+    if any(k in lower_prompt for k in ["create three tasks", "create 3 tasks", "create multiple tasks"]):
+        m_proj = re.search(r"for\s+(?:my\s+)?(.+)", prompt, re.I)
+        proj = m_proj.group(1).strip().rstrip(".") if m_proj else "Project"
+        return json.dumps({
+            "response": f"Creating three milestone tasks for {proj}.",
+            "action": {
+                "tool": "create_multiple_tasks",
+                "parameters": {
+                    "tasks": [
+                        {"title": f"{proj}: Research & Architecture", "due_date": "Today"},
+                        {"title": f"{proj}: Implementation & Integration", "due_date": "Tomorrow"},
+                        {"title": f"{proj}: Testing & Demo Presentation", "due_date": "Next week"}
+                    ]
+                }
+            }
+        })
+
     # Intent 3: Tasks - Create task
     if any(k in lower_prompt for k in ["create a task", "create task", "add task", "new task"]):
-        clean = re.sub(r"^(please\s+)?(create a task to|create task|add task|new task)\s*", "", prompt, flags=re.I).strip()
+        clean = re.sub(r"^(please\s+)?(create a task to|create a task called|create a task|create task called|create task|add task|new task)\s*", "", prompt, flags=re.I).strip()
         due_date = "Today"
-        if "tomorrow" in clean.lower():
+        m_due = re.search(r"\s+(?:for|by|due on|due)\s+([0-9]{1,2}\s+[a-zA-Z]+(?:\s+[0-9]{4})?|[a-zA-Z]+\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|tomorrow|today)", clean, re.I)
+        if m_due:
+            due_date = m_due.group(1).strip().rstrip(".")
+            clean = clean[:m_due.start()].strip()
+        elif "tomorrow" in clean.lower():
             due_date = "tomorrow"
             clean = re.sub(r"\btomorrow\b", "", clean, flags=re.I).strip()
         elif "today" in clean.lower():
             due_date = "today"
             clean = re.sub(r"\btoday\b", "", clean, flags=re.I).strip()
-        
+
+        clean = clean.strip().rstrip(".").strip('"').strip("'")
         return json.dumps({
             "response": f"Preparing to create task '{clean}'.",
             "action": {
@@ -552,6 +606,55 @@ A **calendar conflict** occurs when a newly requested event overlaps in time wit
             }
         })
 
+    # Intent 6B: Calendar - Reschedule / Update event
+    if any(k in lower_prompt for k in ["reschedule", "change the time", "change the date", "move my meeting", "move the meeting", "move my event"]):
+        title_target = "Meeting"
+        m = re.search(r"(?:reschedule|move|change\s+the\s+time\s+of)\s+(?:my\s+)?([a-zA-Z0-9\s]+?)(?:\s+to|\s+from|$)", lower_prompt)
+        if m:
+            title_target = m.group(1).strip()
+
+        new_date = "tomorrow" if "tomorrow" in lower_prompt else None
+        date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", prompt)
+        if date_match:
+            new_date = date_match.group(1)
+
+        new_start = "14:00"
+        new_end = "15:00"
+        time_match = re.search(r"(?:at|to)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", lower_prompt)
+        if time_match:
+            new_start = time_match.group(1).strip()
+            new_end = "15:00"
+
+        return json.dumps({
+            "response": f"Rescheduling event '{title_target}'.",
+            "action": {
+                "tool": "update_calendar_event",
+                "parameters": {
+                    "title": title_target,
+                    "event_date": new_date,
+                    "start_time": new_start,
+                    "end_time": new_end
+                }
+            }
+        })
+
+    # Intent 6C: Calendar - Delete / Cancel event
+    if any(k in lower_prompt for k in ["cancel my", "cancel the", "delete my calendar", "delete the calendar", "remove calendar event", "delete event"]):
+        title_target = "Meeting"
+        m = re.search(r"(?:cancel|delete|remove)\s+(?:my\s+|the\s+)?(?:calendar\s+event\s+|meeting\s+|event\s+)?([a-zA-Z0-9\s]+?)(?:\s+on|\.|$)", lower_prompt)
+        if m:
+            title_target = m.group(1).strip()
+
+        return json.dumps({
+            "response": f"Canceling calendar event '{title_target}'.",
+            "action": {
+                "tool": "delete_calendar_event",
+                "parameters": {
+                    "title": title_target
+                }
+            }
+        })
+
     # Intent 7: Email to Tasks
     if any(k in lower_prompt for k in ["find important emails", "extract deadlines", "create tasks for their deadlines", "check emails for deadlines"]):
         return json.dumps({
@@ -564,8 +667,8 @@ A **calendar conflict** occurs when a newly requested event overlaps in time wit
 
     # Intent 8: YouTube Notes
     if "youtube.com" in lower_prompt or "youtu.be" in lower_prompt or "youtube lecture" in lower_prompt or "youtube video" in lower_prompt:
-        yt_match = re.search(r"(https?://(?:www\.)?(?:youtube\.com/[^\s]+|youtu\.be/[^\s]+))", prompt)
-        yt_url = yt_match.group(1) if yt_match else "https://www.youtube.com/watch?v=sample"
+        url_match = re.search(r"(https?://[^\s]+)", prompt)
+        yt_url = url_match.group(1) if url_match else "https://www.youtube.com/watch?v=sample"
         return json.dumps({
             "response": f"Checking transcript availability for {yt_url}.",
             "action": {
@@ -830,7 +933,11 @@ async def execute_policy_gate_and_tools(
         query = "SELECT id, title, due_date, priority, completed, workspace FROM user_tasks WHERE user_id = ?"
         q_params: List[Any] = [user_id]
 
-        if workspace_id and workspace_id != "main":
+        target_ws = params.get("workspace_name")
+        if target_ws:
+            query += " AND (lower(workspace) = lower(?) OR lower(workspace) LIKE ?)"
+            q_params.extend([target_ws, f"%{target_ws.lower()}%"])
+        elif workspace_id and workspace_id != "main":
             query += " AND (workspace = ? OR workspace = ?)"
             q_params.extend([ws_name, workspace_id])
 
@@ -860,11 +967,78 @@ async def execute_policy_gate_and_tools(
 
         result["tool_executed"] = "list_tasks"
         result["policy_decision"] = "Allowed & Executed"
+        scope_name = target_ws or ws_name
         if not task_rows:
-            result["text"] = f"You have no tasks matching the '{flt}' filter in this workspace."
+            result["text"] = f"You have no tasks matching the '{flt}' filter in workspace '{scope_name}'."
         else:
             task_lines = "\n".join([f"- [{'x' if t['completed'] else ' '}] **{t['title']}** (Due: {t['due_date']}, Priority: {t['priority']}, Workspace: `{t['workspace']}`)" for t in task_rows])
-            result["text"] = f"### Your Tasks ({flt.capitalize()}):\n{task_lines}"
+            result["text"] = f"### Your Tasks ({flt.capitalize()} - {scope_name}):\n{task_lines}"
+        return result
+
+    if tool_name == "create_multiple_tasks":
+        tasks_to_create = params.get("tasks", [])
+        created_titles = []
+        for t_spec in tasks_to_create:
+            t_title = t_spec.get("title", "Milestone Task").strip()
+            t_due = parse_relative_date(t_spec.get("due_date", "Today"))
+            t_prio = t_spec.get("priority", "normal")
+            tid = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{os.urandom(2).hex()}"
+            cursor.execute("""
+                INSERT INTO user_tasks (id, user_id, title, source, due_date, priority, completed, workspace, created_at)
+                VALUES (?, ?, ?, 'Chat Assistant', ?, ?, 0, ?, ?)
+            """, (tid, user_id, t_title, t_due, t_prio, ws_name, datetime.now(timezone.utc).isoformat()))
+            created_titles.append(f"**{t_title}** (Due: {t_due})")
+
+        cursor.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, 'Create Multiple Tasks', 'Completed', ?, ?, ?)
+        """, (f"act_{int(time.time()*1000)}", user_id, latency_ms, f"Created {len(created_titles)} tasks", datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+
+        result["tool_executed"] = "create_multiple_tasks"
+        result["policy_decision"] = "Allowed & Executed"
+        result["text"] = f"Created {len(created_titles)} tasks in workspace `{ws_name}`:\n" + "\n".join([f"- {t}" for t in created_titles])
+        return result
+
+    if tool_name == "update_task":
+        task_id = params.get("task_id")
+        title_search = params.get("title_search", "").strip()
+        new_due = params.get("due_date")
+        new_title = params.get("title")
+        new_priority = params.get("priority")
+
+        if task_id:
+            cursor.execute("SELECT id, title, due_date, priority FROM user_tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+        else:
+            cursor.execute("SELECT id, title, due_date, priority FROM user_tasks WHERE user_id = ? AND lower(title) LIKE ? LIMIT 1", (user_id, f"%{title_search.lower()}%"))
+        t_row = cursor.fetchone()
+
+        if not t_row:
+            conn.close()
+            result["policy_decision"] = "Task Not Found"
+            result["text"] = f"Could not find a task matching '{title_search or task_id}' to update."
+            return result
+
+        parsed_due = parse_relative_date(new_due) if new_due else t_row["due_date"]
+        updated_title = new_title.strip() if new_title and new_title.strip() else t_row["title"]
+        updated_priority = new_priority if new_priority else t_row["priority"]
+
+        cursor.execute("""
+            UPDATE user_tasks SET title = ?, due_date = ?, priority = ?
+            WHERE id = ? AND user_id = ?
+        """, (updated_title, parsed_due, updated_priority, t_row["id"], user_id))
+
+        cursor.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, ?, 'Completed', ?, ?, ?)
+        """, (f"act_{int(time.time()*1000)}", user_id, f"Update Task: {t_row['title']}", latency_ms, f"Updated deadline to {parsed_due}", datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+
+        result["tool_executed"] = "update_task"
+        result["policy_decision"] = "Allowed & Executed"
+        result["text"] = f"Updated deadline for task '{t_row['title']}' to {parsed_due}."
         return result
 
     if tool_name == "create_task":
@@ -1046,6 +1220,88 @@ async def execute_policy_gate_and_tools(
         result["tool_executed"] = "schedule_event"
         result["policy_decision"] = "Allowed & Executed"
         result["text"] = f"Your calendar event '{title}' on {event_date} from {start_time} to {end_time} has been scheduled successfully."
+        return result
+
+    if tool_name == "update_calendar_event":
+        target_id = params.get("event_id")
+        target_title = params.get("title", "").strip().lower()
+        new_date = parse_relative_date(params.get("event_date", "today")) if params.get("event_date") else None
+        new_start = params.get("start_time")
+        new_end = params.get("end_time")
+
+        if target_id:
+            cursor.execute("SELECT * FROM user_calendar_events WHERE id = ? AND user_id = ?", (target_id, user_id))
+        else:
+            cursor.execute("SELECT * FROM user_calendar_events WHERE user_id = ? AND lower(title) LIKE ? ORDER BY event_date ASC LIMIT 1", (user_id, f"%{target_title}%"))
+
+        evt = cursor.fetchone()
+        if not evt:
+            conn.close()
+            result["tool_executed"] = "update_calendar_event"
+            result["policy_decision"] = "Event Not Found"
+            result["text"] = f"Could not find any calendar event matching '{params.get('title', target_id)}' to reschedule."
+            return result
+
+        event_id = evt["id"]
+        updated_date = new_date or evt["event_date"]
+        updated_start = new_start or evt["start_time"]
+        updated_end = new_end or evt["end_time"]
+
+        conflicts = [c for c in detect_calendar_conflicts(user_id, updated_date, updated_start, updated_end) if c["id"] != event_id]
+        if conflicts:
+            c = conflicts[0]
+            conn.close()
+            result["tool_executed"] = "update_calendar_event"
+            result["policy_decision"] = "Refused: Scheduling Conflict Detected"
+            result["text"] = f"Cannot reschedule '{evt['title']}': conflict detected with existing '{c['title']}' ({c['start_time']} - {c['end_time']}) on {updated_date}."
+            return result
+
+        cursor.execute("""
+            UPDATE user_calendar_events
+            SET event_date = ?, start_time = ?, end_time = ?
+            WHERE id = ? AND user_id = ?
+        """, (updated_date, updated_start, updated_end, event_id, user_id))
+
+        cursor.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, ?, 'Completed', ?, ?, ?)
+        """, (f"act_{int(time.time()*1000)}", user_id, f"Reschedule Event: {evt['title']}", latency_ms, f"Moved to {updated_date} ({updated_start} - {updated_end})", datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+
+        result["tool_executed"] = "update_calendar_event"
+        result["policy_decision"] = "Allowed & Executed"
+        result["text"] = f"Successfully rescheduled calendar event '{evt['title']}' to {updated_date} ({updated_start} - {updated_end})."
+        return result
+
+    if tool_name == "delete_calendar_event":
+        target_id = params.get("event_id")
+        target_title = params.get("title", "").strip().lower()
+
+        if target_id:
+            cursor.execute("SELECT * FROM user_calendar_events WHERE id = ? AND user_id = ?", (target_id, user_id))
+        else:
+            cursor.execute("SELECT * FROM user_calendar_events WHERE user_id = ? AND lower(title) LIKE ? ORDER BY event_date ASC LIMIT 1", (user_id, f"%{target_title}%"))
+
+        evt = cursor.fetchone()
+        if not evt:
+            conn.close()
+            result["tool_executed"] = "delete_calendar_event"
+            result["policy_decision"] = "Event Not Found"
+            result["text"] = f"Could not find any calendar event matching '{params.get('title', target_id)}' to delete."
+            return result
+
+        cursor.execute("DELETE FROM user_calendar_events WHERE id = ? AND user_id = ?", (evt["id"], user_id))
+        cursor.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, ?, 'Completed', ?, ?, ?)
+        """, (f"act_{int(time.time()*1000)}", user_id, f"Delete Event: {evt['title']}", latency_ms, "Event canceled and removed", datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+
+        result["tool_executed"] = "delete_calendar_event"
+        result["policy_decision"] = "Allowed & Executed"
+        result["text"] = f"Successfully canceled and removed calendar event '{evt['title']}' scheduled on {evt['event_date']}."
         return result
 
     # =========================================================
