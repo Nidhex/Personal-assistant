@@ -3,7 +3,7 @@ import sys
 import time
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from .database import init_db, get_db
+from .scheduler import scheduler
+from .orchestrator import get_or_create_user_settings, update_user_settings, execute_daily_run
 from .security import (
     generate_session_id,
     generate_oauth_state,
@@ -45,6 +47,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def on_startup():
+    scheduler.start()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    scheduler.stop()
 
 DEV_TEST_MODE = os.getenv("DEV_TEST_MODE", "false").lower() == "true"
 
@@ -515,14 +525,33 @@ def get_user_data(user: dict = Depends(get_current_user)):
     """, (user["id"],))
     calendar_events = [dict(row) for row in cursor.fetchall()]
 
+    # Retrieve latest daily digest
+    cursor.execute("""
+        SELECT id, run_id, digest_date, title, content_json, created_at
+        FROM daily_digests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
+    """, (user["id"],))
+    dig_row = cursor.fetchone()
+    daily_digest = None
+    if dig_row:
+        daily_digest = dict(dig_row)
+        try:
+            daily_digest["content"] = json.loads(daily_digest["content_json"])
+        except Exception:
+            daily_digest["content"] = {}
+
     conn.close()
+
+    agent_settings = get_or_create_user_settings(user["id"])
 
     return {
         "tasks": tasks,
         "workspaces": workspaces,
         "approvals": approvals,
         "activity": activity,
-        "calendar_events": calendar_events
+        "calendar_events": calendar_events,
+        "daily_digest": daily_digest,
+        "agent_settings": agent_settings,
+        "kill_switch_active": bool(agent_settings.get("kill_switch_enabled", 0))
     }
 
 class CreateTaskRequest(BaseModel):
@@ -1059,4 +1088,126 @@ def get_revision_plan(
     d = dict(row)
     d["sessions"] = json.loads(d["plan_json"])
     return {"plan": d}
+
+# -------------------------------------------------------------
+# AGENT RUNS, DIGESTS & SCHEDULER ENDPOINTS
+# -------------------------------------------------------------
+class UpdateAgentSettingsRequest(BaseModel):
+    daily_run_enabled: Optional[bool] = None
+    preferred_time: Optional[str] = None
+    timezone: Optional[str] = None
+    permitted_sources: Optional[List[str]] = None
+    kill_switch_enabled: Optional[bool] = None
+
+class SetKillSwitchRequest(BaseModel):
+    enabled: bool
+
+@app.get("/api/agent/settings")
+def get_agent_settings_endpoint(user: dict = Depends(get_current_user)):
+    """Returns scheduled run settings for authenticated user."""
+    return {"settings": get_or_create_user_settings(user["id"])}
+
+@app.post("/api/agent/settings")
+def save_agent_settings(req: UpdateAgentSettingsRequest, user: dict = Depends(get_current_user)):
+    """Updates opt-in scheduled run settings."""
+    payload = {}
+    if req.daily_run_enabled is not None:
+        payload["daily_run_enabled"] = req.daily_run_enabled
+    if req.preferred_time is not None:
+        payload["preferred_time"] = req.preferred_time
+    if req.timezone is not None:
+        payload["timezone"] = req.timezone
+    if req.permitted_sources is not None:
+        payload["permitted_sources"] = req.permitted_sources
+    if req.kill_switch_enabled is not None:
+        payload["kill_switch_enabled"] = req.kill_switch_enabled
+
+    updated = update_user_settings(user["id"], payload)
+    return {"success": True, "settings": updated}
+
+@app.post("/api/agent/kill-switch")
+def toggle_kill_switch(req: SetKillSwitchRequest, user: dict = Depends(get_current_user)):
+    """Enables or disables emergency kill switch immediately."""
+    updated = update_user_settings(user["id"], {"kill_switch_enabled": req.enabled})
+    return {"success": True, "kill_switch_enabled": bool(updated["kill_switch_enabled"])}
+
+@app.post("/api/agent/runs/trigger")
+async def trigger_manual_run(user: dict = Depends(get_current_user)):
+    """Triggers an immediate unattended agent run for the user."""
+    res = await execute_daily_run(user["id"], trigger_type="manual")
+    return res
+
+@app.get("/api/agent/runs")
+def get_agent_runs(user: dict = Depends(get_current_user)):
+    """Lists historical agent runs with high-level statistics."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, trigger_type, status, started_at, completed_at, total_steps,
+               actions_completed, actions_refused, actions_failed, summary, error_message
+        FROM agent_runs WHERE user_id = ? ORDER BY started_at DESC LIMIT 15
+    """, (user["id"],))
+    runs = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"runs": runs}
+
+@app.get("/api/agent/runs/{run_id}/steps")
+def get_agent_run_steps(run_id: str, user: dict = Depends(get_current_user)):
+    """Returns granular execution steps and policy audits for a specific run."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM agent_runs WHERE id = ? AND user_id = ?", (run_id, user["id"]))
+    if not cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Run not found.")
+
+    cursor.execute("""
+        SELECT id, run_id, step_number, step_name, tool_name, tool_parameters,
+               policy_decision, approval_required, status, result, latency_ms, created_at
+        FROM agent_run_steps WHERE run_id = ? AND user_id = ? ORDER BY step_number ASC
+    """, (run_id, user["id"]))
+    steps = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"steps": steps}
+
+@app.get("/api/agent/digests/latest")
+def get_latest_daily_digest(user: dict = Depends(get_current_user)):
+    """Retrieves the latest structured daily digest for the authenticated user."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, run_id, digest_date, title, content_json, created_at
+        FROM daily_digests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
+    """, (user["id"],))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return {"digest": None}
+    d = dict(row)
+    try:
+        d["content"] = json.loads(d["content_json"])
+    except Exception:
+        d["content"] = {}
+    return {"digest": d}
+
+@app.get("/api/agent/digests")
+def get_daily_digests(user: dict = Depends(get_current_user)):
+    """Lists historical daily digests."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, run_id, digest_date, title, content_json, created_at
+        FROM daily_digests WHERE user_id = ? ORDER BY created_at DESC LIMIT 10
+    """, (user["id"],))
+    rows = cursor.fetchall()
+    conn.close()
+    digests = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["content"] = json.loads(d["content_json"])
+        except Exception:
+            d["content"] = {}
+        digests.append(d)
+    return {"digests": digests}
 

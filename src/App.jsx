@@ -19,7 +19,8 @@ import {
   Power,
   ShieldCheck,
   RefreshCw,
-  LogOut
+  LogOut,
+  Sparkles
 } from 'lucide-react'
 
 // Import API client (strict backend integration preserved)
@@ -41,6 +42,7 @@ import StudyView from './views/StudyView'
 import PlanningView from './views/PlanningView'
 import WorkspacesChatView from './views/WorkspacesChatView'
 import ActivityTraceView from './views/ActivityTraceView'
+import DailyDigestView from './views/DailyDigestView'
 import AccountsSettingsView from './views/AccountsSettingsView'
 
 export default function App() {
@@ -65,7 +67,7 @@ export default function App() {
   const [approvals, setApprovals] = useState([])
   const [workspaces, setWorkspaces] = useState([])
   const [traces, setTraces] = useState([])
-  const [dailyDigest] = useState(null)
+  const [dailyDigest, setDailyDigest] = useState(null)
 
   const showToast = (msg) => {
     setToastMessage(msg)
@@ -124,6 +126,12 @@ export default function App() {
           startTime: e.start_time,
           endTime: e.end_time
         })))
+      }
+      if (userData.daily_digest) {
+        setDailyDigest(userData.daily_digest)
+      }
+      if (userData.kill_switch_active !== undefined) {
+        setKillSwitchActive(Boolean(userData.kill_switch_active))
       }
 
       if (isGmailConnected) {
@@ -228,6 +236,7 @@ export default function App() {
     {
       heading: 'REVIEW',
       items: [
+        { id: 'digest', label: 'Daily Briefing', icon: Sparkles },
         {
           id: 'approvals',
           label: 'Approvals',
@@ -256,6 +265,7 @@ export default function App() {
     planning: 'Project Planning',
     main_chat: 'Assistant Chat',
     workspaces: 'Workspaces',
+    digest: 'Daily Briefing & Agent Runs',
     approvals: 'Approvals Review',
     activity: 'Activity & Trace',
     accounts: 'Connected Accounts',
@@ -585,6 +595,16 @@ export default function App() {
                 isMainChatOnly={false}
                 killSwitchActive={killSwitchActive}
                 showToast={showToast}
+              />
+            )}
+
+            {activeTab === 'digest' && (
+              <DailyDigestView
+                showToast={showToast}
+                currentUser={currentUser}
+                killSwitchActive={killSwitchActive}
+                setKillSwitchActive={setKillSwitchActive}
+                setActiveTab={setActiveTab}
               />
             )}
 

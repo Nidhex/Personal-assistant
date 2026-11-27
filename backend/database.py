@@ -212,6 +212,79 @@ def init_db():
     )
     """)
 
+    # User Agent Settings & Preferences for Scheduled Runs (opt-in by default)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_agent_settings (
+        user_id TEXT PRIMARY KEY,
+        daily_run_enabled INTEGER DEFAULT 0,
+        preferred_time TEXT DEFAULT '08:00',
+        timezone TEXT DEFAULT 'UTC',
+        permitted_sources TEXT DEFAULT '["gmail","tasks","calendar"]',
+        max_duration_seconds INTEGER DEFAULT 120,
+        max_tool_steps INTEGER DEFAULT 10,
+        kill_switch_enabled INTEGER DEFAULT 0,
+        next_run_at TEXT,
+        last_run_at TEXT,
+        last_run_status TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+    """)
+
+    # Agent Runs (execution lifecycle & high-level status)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS agent_runs (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        trigger_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        total_steps INTEGER DEFAULT 0,
+        actions_completed INTEGER DEFAULT 0,
+        actions_refused INTEGER DEFAULT 0,
+        actions_failed INTEGER DEFAULT 0,
+        summary TEXT,
+        error_message TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+    """)
+
+    # Agent Run Steps (granular execution audit & policy trace)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS agent_run_steps (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        step_number INTEGER NOT NULL,
+        step_name TEXT NOT NULL,
+        tool_name TEXT,
+        tool_parameters TEXT,
+        policy_decision TEXT NOT NULL,
+        approval_required INTEGER DEFAULT 0,
+        status TEXT NOT NULL,
+        result TEXT,
+        latency_ms TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (run_id) REFERENCES agent_runs (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+    """)
+
+    # Daily Digests (structured attention summaries)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS daily_digests (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        run_id TEXT,
+        digest_date TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+    """)
+
     conn.commit()
     conn.close()
 

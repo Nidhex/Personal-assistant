@@ -266,3 +266,67 @@ export async function fetchWorkspaceRevisionPlan(workspaceId) {
   return await res.json()
 }
 
+// -------------------------------------------------------------
+// DAILY RUNS, DIGESTS & SCHEDULER API
+// -------------------------------------------------------------
+export async function fetchAgentSettings() {
+  const res = await fetch('/api/agent/settings')
+  if (!res.ok) return { settings: null }
+  return await res.json()
+}
+
+export async function updateAgentSettings(settings) {
+  const res = await fetch('/api/agent/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  })
+  if (!res.ok) throw new Error('Failed to update agent settings')
+  return await res.json()
+}
+
+export async function setKillSwitchApi(enabled) {
+  const res = await fetch('/api/agent/kill-switch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled })
+  })
+  if (!res.ok) throw new Error('Failed to toggle kill switch')
+  return await res.json()
+}
+
+export async function triggerManualAgentRun() {
+  const res = await fetch('/api/agent/runs/trigger', {
+    method: 'POST'
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to trigger agent run')
+  }
+  return await res.json()
+}
+
+export async function fetchAgentRuns() {
+  const res = await fetch('/api/agent/runs')
+  if (!res.ok) return { runs: [] }
+  return await res.json()
+}
+
+export async function fetchAgentRunSteps(runId) {
+  const res = await fetch(`/api/agent/runs/${runId}/steps`)
+  if (!res.ok) throw new Error('Failed to fetch run execution steps')
+  return await res.json()
+}
+
+export async function fetchLatestDailyDigest() {
+  const res = await fetch('/api/agent/digests/latest')
+  if (!res.ok) return { digest: null }
+  return await res.json()
+}
+
+export async function fetchDailyDigests() {
+  const res = await fetch('/api/agent/digests')
+  if (!res.ok) return { digests: [] }
+  return await res.json()
+}
+
