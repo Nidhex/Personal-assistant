@@ -165,6 +165,53 @@ def init_db():
     )
     """)
 
+    # Calendar Events (isolated per user & optional workspace)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_calendar_events (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        workspace_id TEXT,
+        title TEXT NOT NULL,
+        event_date TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        category TEXT DEFAULT 'General',
+        description TEXT,
+        source TEXT DEFAULT 'Scheduled Block',
+        external_event_id TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+    """)
+
+    # Study Materials (isolated per user & workspace)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_study_materials (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        content_text TEXT NOT NULL,
+        topics_json TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+    """)
+
+    # Revision Plans (isolated per user & workspace)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_revision_plans (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        exam_date TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+    """)
+
     conn.commit()
     conn.close()
 

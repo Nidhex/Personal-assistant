@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from 'react'
+import { createCalendarEvent } from '../api'
 import {
   Calendar as CalendarIcon,
   Clock,
@@ -131,7 +132,7 @@ export default function CalendarView({
   }
 
   // Handle Event Creation
-  const handleSaveEvent = (e) => {
+  const handleSaveEvent = async (e) => {
     e.preventDefault()
     if (!eventTitle.trim()) {
       showToast('Please enter an event title.')
@@ -167,6 +168,20 @@ export default function CalendarView({
 
     if (setCalendarEvents) {
       setCalendarEvents(prev => [...prev, newEvt])
+    }
+
+    try {
+      await createCalendarEvent({
+        title: eventTitle.trim(),
+        event_date: eventDate,
+        start_time: eventStartTime,
+        end_time: eventEndTime,
+        category: eventCategory,
+        description: eventDescription.trim() || 'Scheduled calendar block',
+        force: !!conflictWarning
+      })
+    } catch {
+      // Retain optimistic client display
     }
 
     // Reset Form

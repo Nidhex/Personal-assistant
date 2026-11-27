@@ -444,13 +444,20 @@ def get_user_data(user: dict = Depends(get_current_user)):
     """, (user["id"],))
     activity = [dict(row) for row in cursor.fetchall()]
 
+    cursor.execute("""
+        SELECT id, workspace_id, title, event_date, start_time, end_time, category, description, source, created_at
+        FROM user_calendar_events WHERE user_id = ? ORDER BY event_date ASC, start_time ASC
+    """, (user["id"],))
+    calendar_events = [dict(row) for row in cursor.fetchall()]
+
     conn.close()
 
     return {
         "tasks": tasks,
         "workspaces": workspaces,
         "approvals": approvals,
-        "activity": activity
+        "activity": activity,
+        "calendar_events": calendar_events
     }
 
 class CreateTaskRequest(BaseModel):
@@ -792,4 +799,151 @@ def add_workspace_note(
             "created_at": now_str
         }
     }
+
+# -------------------------------------------------------------
+# CALENDAR EVENT ENDPOINTS
+# -------------------------------------------------------------
+class CreateCalendarEventRequest(BaseModel):
+    title: str
+    event_date: str
+    start_time: str
+    end_time: str
+    category: Optional[str] = "General"
+    description: Optional[str] = "Scheduled Block"
+    workspace_id: Optional[str] = None
+    force: Optional[bool] = False
+
+@app.get("/api/user/calendar/events")
+def get_calendar_events(
+    date: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    conn = get_db()
+    cursor = conn.cursor()
+    if date:
+        cursor.execute("""
+            SELECT id, workspace_id, title, event_date, start_time, end_time, category, description, source, created_at
+            FROM user_calendar_events WHERE user_id = ? AND event_date = ?
+            ORDER BY start_time ASC
+        """, (user["id"], date))
+    else:
+        cursor.execute("""
+            SELECT id, workspace_id, title, event_date, start_time, end_time, category, description, source, created_at
+            FROM user_calendar_events WHERE user_id = ?
+            ORDER BY event_date ASC, start_time ASC
+        """, (user["id"],))
+    events = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"events": events}
+
+@app.post("/api/user/calendar/events")
+def create_calendar_event(
+    req: CreateCalendarEventRequest,
+    user: dict = Depends(get_current_user)
+):
+    from .agent import detect_calendar_conflicts
+    if not req.force:
+        conflicts = detect_calendar_conflicts(user["id"], req.event_date, req.start_time, req.end_time)
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Calendar conflict with existing event '{conflicts[0]['title']}' ({conflicts[0]['start_time']} - {conflicts[0]['end_time']})."
+            )
+
+    event_id = f"evt_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO user_calendar_events (id, user_id, workspace_id, title, event_date, start_time, end_time, category, description, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'User Scheduled', ?)
+    """, (event_id, user["id"], req.workspace_id, req.title.strip(), req.event_date, req.start_time, req.end_time, req.category, req.description, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "event": {
+            "id": event_id,
+            "title": req.title.strip(),
+            "event_date": req.event_date,
+            "start_time": req.start_time,
+            "end_time": req.end_time,
+            "category": req.category,
+            "description": req.description
+        }
+    }
+
+@app.delete("/api/user/calendar/events/{event_id}")
+def delete_calendar_event(
+    event_id: str,
+    user: dict = Depends(get_current_user)
+):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM user_calendar_events WHERE id = ? AND user_id = ?", (event_id, user["id"]))
+    if not cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Event not found.")
+    cursor.execute("DELETE FROM user_calendar_events WHERE id = ? AND user_id = ?", (event_id, user["id"]))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+# -------------------------------------------------------------
+# STUDY MATERIALS & REVISION PLAN ENDPOINTS
+# -------------------------------------------------------------
+class UploadStudyMaterialRequest(BaseModel):
+    filename: str
+    content_text: str
+
+@app.get("/api/user/workspaces/{workspace_id}/study-materials")
+def get_study_materials(
+    workspace_id: str,
+    user: dict = Depends(get_current_user)
+):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, workspace_id, filename, content_text, created_at
+        FROM user_study_materials WHERE workspace_id = ? AND user_id = ?
+        ORDER BY created_at DESC
+    """, (workspace_id, user["id"]))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"materials": rows}
+
+@app.post("/api/user/workspaces/{workspace_id}/study-materials")
+def upload_study_material(
+    workspace_id: str,
+    req: UploadStudyMaterialRequest,
+    user: dict = Depends(get_current_user)
+):
+    mat_id = f"mat_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO user_study_materials (id, user_id, workspace_id, filename, content_text, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (mat_id, user["id"], workspace_id, req.filename.strip(), req.content_text.strip(), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+    return {"success": True, "material": {"id": mat_id, "filename": req.filename.strip()}}
+
+@app.get("/api/user/workspaces/{workspace_id}/revision-plan")
+def get_revision_plan(
+    workspace_id: str,
+    user: dict = Depends(get_current_user)
+):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, workspace_id, exam_date, plan_json, created_at, updated_at
+        FROM user_revision_plans WHERE workspace_id = ? AND user_id = ?
+        ORDER BY created_at DESC LIMIT 1
+    """, (workspace_id, user["id"]))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return {"plan": None}
+    d = dict(row)
+    d["sessions"] = json.loads(d["plan_json"])
+    return {"plan": d}
 

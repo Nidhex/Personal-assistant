@@ -198,3 +198,59 @@ export async function createWorkspaceNote(workspaceId, title, content) {
   return await res.json()
 }
 
+// -------------------------------------------------------------
+// CALENDAR API
+// -------------------------------------------------------------
+export async function fetchCalendarEvents(date = null) {
+  const url = date ? `/api/user/calendar/events?date=${encodeURIComponent(date)}` : '/api/user/calendar/events'
+  const res = await fetch(url)
+  if (!res.ok) return { events: [] }
+  return await res.json()
+}
+
+export async function createCalendarEvent(eventData) {
+  const res = await fetch('/api/user/calendar/events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(eventData)
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to create calendar event')
+  }
+  return await res.json()
+}
+
+export async function deleteCalendarEvent(eventId) {
+  const res = await fetch(`/api/user/calendar/events/${eventId}`, {
+    method: 'DELETE'
+  })
+  if (!res.ok) throw new Error('Failed to delete calendar event')
+  return await res.json()
+}
+
+// -------------------------------------------------------------
+// STUDY MATERIALS & REVISION PLAN API
+// -------------------------------------------------------------
+export async function fetchWorkspaceStudyMaterials(workspaceId) {
+  const res = await fetch(`/api/user/workspaces/${workspaceId}/study-materials`)
+  if (!res.ok) return { materials: [] }
+  return await res.json()
+}
+
+export async function uploadStudyMaterial(workspaceId, filename, contentText) {
+  const res = await fetch(`/api/user/workspaces/${workspaceId}/study-materials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename, content_text: contentText })
+  })
+  if (!res.ok) throw new Error('Failed to upload study material')
+  return await res.json()
+}
+
+export async function fetchWorkspaceRevisionPlan(workspaceId) {
+  const res = await fetch(`/api/user/workspaces/${workspaceId}/revision-plan`)
+  if (!res.ok) return { plan: null }
+  return await res.json()
+}
+

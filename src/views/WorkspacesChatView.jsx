@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Sparkles,
   ShieldAlert,
+  AlertTriangle,
   FileText,
   CheckCircle2,
   Calendar,
@@ -692,17 +693,25 @@ export default function WorkspacesChatView({
 
                       {/* Tool Execution or Policy Status Badge */}
                       {metadata && metadata.tool_executed && (
-                        <div className="flex items-center gap-1.5 text-[10px] font-mono text-[#6B7280] px-1">
-                          <CheckCircle2 className="h-3 w-3 text-[#708A4E]" />
+                        <div className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-lg w-fit border ${
+                          (metadata.policy_decision || '').includes('Refused') || (metadata.policy_decision || '').includes('Conflict')
+                            ? 'bg-[#E9DB91]/30 border-[#E9DB91] text-[#854D0E]'
+                            : 'bg-[#D5E0BD]/30 border-[#D5E0BD] text-[#42542B]'
+                        }`}>
+                          {(metadata.policy_decision || '').includes('Refused') || (metadata.policy_decision || '').includes('Conflict') ? (
+                            <AlertTriangle className="h-3 w-3 shrink-0" />
+                          ) : (
+                            <CheckCircle2 className="h-3 w-3 shrink-0" />
+                          )}
                           <span>Tool: {metadata.tool_executed}</span>
                           <span>•</span>
-                          <span className="text-[#242424]">{metadata.policy_decision}</span>
+                          <span className="font-semibold">{metadata.policy_decision}</span>
                         </div>
                       )}
 
                       {metadata && metadata.approval_required && (
                         <div className="flex items-center gap-1.5 text-[10px] font-mono text-[#854D0E] bg-[#E9DB91]/40 border border-[#E9DB91] px-2 py-0.5 rounded-lg w-fit">
-                          <ShieldAlert className="h-3 w-3" />
+                          <ShieldAlert className="h-3 w-3 shrink-0" />
                           <span>Action Staged in Approvals Queue</span>
                         </div>
                       )}

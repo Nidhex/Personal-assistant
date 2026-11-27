@@ -116,6 +116,15 @@ export default function App() {
       setWorkspaces(userData.workspaces || [])
       setApprovals(userData.approvals || [])
       setTraces(userData.activity || [])
+      if (userData.calendar_events) {
+        setCalendarEvents(userData.calendar_events.map(e => ({
+          ...e,
+          date: e.event_date,
+          time: `${e.start_time} - ${e.end_time}`,
+          startTime: e.start_time,
+          endTime: e.end_time
+        })))
+      }
 
       if (isGmailConnected) {
         try {
