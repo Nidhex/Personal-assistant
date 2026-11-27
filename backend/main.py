@@ -667,7 +667,13 @@ async def get_messages(
                 "nextPageToken": None,
                 "error": "Gmail authorization has expired or was revoked. Please reconnect."
             }
-        raise HTTPException(status_code=500, detail=f"Failed to fetch Gmail messages: {err_msg}")
+        # In worker environment or network rate limit, return graceful non-fatal error response instead of 500 crash
+        return {
+            "connected": False,
+            "messages": [],
+            "nextPageToken": None,
+            "error": f"Failed to fetch Gmail messages: {err_msg}"
+        }
 
 @app.get("/api/gmail/messages/{message_id}")
 async def get_message_detail(
@@ -767,43 +773,43 @@ async def disconnect_gmail(user: dict = Depends(get_current_user)):
 # USER DATA ENDPOINTS (STRICT USER ISOLATION)
 # -------------------------------------------------------------
 @app.get("/api/user/data")
-def get_user_data(user: dict = Depends(get_current_user)):
+async def get_user_data(user: dict = Depends(get_current_user)):
     """Returns all private data items for the authenticated user."""
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("""
+    await cursor.execute("""
         SELECT id, title, source, source_email_id, due_date, priority, completed, workspace
         FROM user_tasks WHERE user_id = ? ORDER BY created_at DESC
     """, (user["id"],))
     tasks = [dict(row) for row in cursor.fetchall()]
 
-    cursor.execute("""
+    await cursor.execute("""
         SELECT id, name, type, description
         FROM user_workspaces WHERE user_id = ? ORDER BY created_at DESC
     """, (user["id"],))
     workspaces = [dict(row) for row in cursor.fetchall()]
 
-    cursor.execute("""
+    await cursor.execute("""
         SELECT id, type, target, subject, reason, risk_level, draft_content, status, created_at
         FROM user_approvals WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC
     """, (user["id"],))
     approvals = [dict(row) for row in cursor.fetchall()]
 
-    cursor.execute("""
+    await cursor.execute("""
         SELECT id, trigger, status, latency, result, created_at
         FROM user_activity WHERE user_id = ? ORDER BY created_at DESC LIMIT 20
     """, (user["id"],))
     activity = [dict(row) for row in cursor.fetchall()]
 
-    cursor.execute("""
+    await cursor.execute("""
         SELECT id, workspace_id, title, event_date, start_time, end_time, category, description, source, created_at
         FROM user_calendar_events WHERE user_id = ? ORDER BY event_date ASC, start_time ASC
     """, (user["id"],))
     calendar_events = [dict(row) for row in cursor.fetchall()]
 
     # Retrieve latest daily digest
-    cursor.execute("""
+    await cursor.execute("""
         SELECT id, run_id, digest_date, title, content_json, created_at
         FROM daily_digests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
     """, (user["id"],))
@@ -818,7 +824,8 @@ def get_user_data(user: dict = Depends(get_current_user)):
 
     conn.close()
 
-    agent_settings = get_or_create_user_settings(user["id"])
+    raw_settings = get_or_create_user_settings(user["id"])
+    agent_settings = await raw_settings if hasattr(raw_settings, "__await__") else raw_settings
 
     return {
         "tasks": tasks,
@@ -1717,12 +1724,14 @@ class SetKillSwitchRequest(BaseModel):
     enabled: bool
 
 @app.get("/api/agent/settings")
-def get_agent_settings_endpoint(user: dict = Depends(get_current_user)):
+async def get_agent_settings_endpoint(user: dict = Depends(get_current_user)):
     """Returns scheduled run settings for authenticated user."""
-    return {"settings": get_or_create_user_settings(user["id"])}
+    raw_settings = get_or_create_user_settings(user["id"])
+    settings = await raw_settings if hasattr(raw_settings, "__await__") else raw_settings
+    return {"settings": settings}
 
 @app.post("/api/agent/settings")
-def save_agent_settings(req: UpdateAgentSettingsRequest, user: dict = Depends(get_current_user)):
+async def save_agent_settings(req: UpdateAgentSettingsRequest, user: dict = Depends(get_current_user)):
     """Updates opt-in scheduled run settings."""
     payload = {}
     if req.daily_run_enabled is not None:
@@ -1736,13 +1745,15 @@ def save_agent_settings(req: UpdateAgentSettingsRequest, user: dict = Depends(ge
     if req.kill_switch_enabled is not None:
         payload["kill_switch_enabled"] = req.kill_switch_enabled
 
-    updated = update_user_settings(user["id"], payload)
+    raw_updated = update_user_settings(user["id"], payload)
+    updated = await raw_updated if hasattr(raw_updated, "__await__") else raw_updated
     return {"success": True, "settings": updated}
 
 @app.post("/api/agent/kill-switch")
-def toggle_kill_switch(req: SetKillSwitchRequest, user: dict = Depends(get_current_user)):
+async def toggle_kill_switch(req: SetKillSwitchRequest, user: dict = Depends(get_current_user)):
     """Enables or disables emergency kill switch immediately."""
-    updated = update_user_settings(user["id"], {"kill_switch_enabled": req.enabled})
+    raw_updated = update_user_settings(user["id"], {"kill_switch_enabled": req.enabled})
+    updated = await raw_updated if hasattr(raw_updated, "__await__") else raw_updated
     return {"success": True, "kill_switch_enabled": bool(updated["kill_switch_enabled"])}
 
 @app.post("/api/agent/runs/trigger")

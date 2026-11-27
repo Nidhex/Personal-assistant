@@ -90,7 +90,78 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 3400)
   }
 
-  // Check URL parameters for OAuth return
+  const loadRealUserData = async (isGmailConnected) => {
+    try {
+      const userData = await fetchUserData()
+      if (userData) {
+        setTasks(userData.tasks || [])
+        setWorkspaces(userData.workspaces || [])
+        setApprovals(userData.approvals || [])
+        setTraces(userData.activity || [])
+        if (userData.calendar_events) {
+          setCalendarEvents(userData.calendar_events.map(e => ({
+            ...e,
+            date: e.event_date,
+            time: `${e.start_time} - ${e.end_time}`,
+            startTime: e.start_time,
+            endTime: e.end_time
+          })))
+        }
+        if (userData.daily_digest) {
+          setDailyDigest(userData.daily_digest)
+        }
+        if (userData.kill_switch_active !== undefined) {
+          setKillSwitchActive(Boolean(userData.kill_switch_active))
+        }
+      }
+
+      if (isGmailConnected) {
+        try {
+          const mailData = await fetchGmailMessages(null, 15)
+          if (mailData && mailData.connected) {
+            setEmails(mailData.messages || [])
+          }
+        } catch {
+          setEmails([])
+        }
+      } else {
+        setEmails([])
+      }
+    } catch (err) {
+      console.warn("loadRealUserData failed:", err)
+    }
+  }
+
+  // Check URL parameters for OAuth return and load authenticated user
+  const loadAuthAndUser = async () => {
+    setAuthLoading(true)
+    try {
+      const [statusData, meData] = await Promise.all([
+        checkAuthStatus(),
+        fetchCurrentUser()
+      ])
+
+      setAuthStatus(statusData)
+
+      if (meData.authenticated && meData.user) {
+        setCurrentUser(meData.user)
+        setGmailConnected(meData.gmail_connected)
+        try {
+          await loadRealUserData(meData.gmail_connected)
+        } catch (dataErr) {
+          console.warn("Non-fatal background data fetch error:", dataErr)
+        }
+      } else {
+        setCurrentUser(null)
+        setGmailConnected(false)
+      }
+    } catch {
+      setCurrentUser(null)
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     if (params.get('auth_error')) {
@@ -105,75 +176,7 @@ export default function App() {
     if (params.get('auth_success') || params.get('auth_error') || sid) {
       window.history.replaceState({}, document.title, window.location.pathname)
     }
-  }, [])
 
-  // Check Auth on initial load
-  const loadAuthAndUser = async () => {
-    setAuthLoading(true)
-    try {
-      const [statusData, meData] = await Promise.all([
-        checkAuthStatus(),
-        fetchCurrentUser()
-      ])
-
-      setAuthStatus(statusData)
-
-      if (meData.authenticated && meData.user) {
-        setCurrentUser(meData.user)
-        setGmailConnected(meData.gmail_connected)
-        await loadRealUserData(meData.gmail_connected)
-      } else {
-        setCurrentUser(null)
-        setGmailConnected(false)
-      }
-    } catch {
-      setCurrentUser(null)
-    } finally {
-      setAuthLoading(false)
-    }
-  }
-
-  const loadRealUserData = async (isGmailConnected) => {
-    try {
-      const userData = await fetchUserData()
-      setTasks(userData.tasks || [])
-      setWorkspaces(userData.workspaces || [])
-      setApprovals(userData.approvals || [])
-      setTraces(userData.activity || [])
-      if (userData.calendar_events) {
-        setCalendarEvents(userData.calendar_events.map(e => ({
-          ...e,
-          date: e.event_date,
-          time: `${e.start_time} - ${e.end_time}`,
-          startTime: e.start_time,
-          endTime: e.end_time
-        })))
-      }
-      if (userData.daily_digest) {
-        setDailyDigest(userData.daily_digest)
-      }
-      if (userData.kill_switch_active !== undefined) {
-        setKillSwitchActive(Boolean(userData.kill_switch_active))
-      }
-
-      if (isGmailConnected) {
-        try {
-          const mailData = await fetchGmailMessages(null, 15)
-          if (mailData.connected) {
-            setEmails(mailData.messages || [])
-          }
-        } catch {
-          setEmails([])
-        }
-      } else {
-        setEmails([])
-      }
-    } catch {
-      // Retain clean empty structures
-    }
-  }
-
-  useEffect(() => {
     loadAuthAndUser()
   }, [])
 

@@ -406,20 +406,22 @@ async def fetch_gmail_messages(user_id: str, max_results: int = 15, page_token: 
                 "resultSizeEstimate": list_data.get("resultSizeEstimate", 0)
             }
 
-        # Fetch metadata for each message concurrently using asyncio.gather
+        # Fetch metadata for each message concurrently with bounded semaphore to avoid worker subrequest limits
+        sem = asyncio.Semaphore(3)
         async def _fetch_single_meta(msg_id: str):
-            try:
-                msg_res = await client.get(
-                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]},
-                    timeout=10.0
-                )
-                if msg_res.status_code == 200:
-                    return msg_res.json()
-            except Exception:
-                pass
-            return None
+            async with sem:
+                try:
+                    msg_res = await client.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]},
+                        timeout=10.0
+                    )
+                    if msg_res.status_code == 200:
+                        return msg_res.json()
+                except Exception:
+                    pass
+                return None
 
         raw_meta_results = await asyncio.gather(*[_fetch_single_meta(item["id"]) for item in message_summaries])
 

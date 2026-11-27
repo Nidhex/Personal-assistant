@@ -14,13 +14,77 @@ from .agent import detect_calendar_conflicts, parse_relative_date, parse_time_to
 # Active run locks in memory to prevent concurrent / overlapping runs per user
 _ACTIVE_USER_RUNS = set()
 
+class SettingsDict(dict):
+    """
+    Dictionary subclass with async __await__ support that enables transparent
+    access in both synchronous SQLite workflows and asynchronous Cloudflare D1 workflows.
+    """
+    def __init__(self, data=None, coro=None):
+        if data:
+            super().__init__(data)
+        self._coro = coro
+
+    async def _resolve(self):
+        if self._coro is not None:
+            res = await self._coro
+            self.update(res)
+            self._coro = None
+        return self
+
+    def __await__(self):
+        return self._resolve().__await__()
+
 # -------------------------------------------------------------
 # 1. USER SETTINGS & PREFERENCES MANAGEMENT
 # -------------------------------------------------------------
-def get_or_create_user_settings(user_id: str) -> Dict[str, Any]:
+def get_or_create_user_settings(user_id: str) -> SettingsDict:
     """Retrieves user agent settings. If none exist, initializes safe opt-in defaults."""
     conn = get_db()
     cursor = conn.cursor()
+
+    # Cloudflare Python Worker async D1 mode
+    if getattr(conn, "worker_env", None) and hasattr(conn.worker_env, "DB"):
+        async def _fetch_d1():
+            await cursor.execute("""
+                SELECT user_id, daily_run_enabled, preferred_time, timezone, permitted_sources,
+                       max_duration_seconds, max_tool_steps, kill_switch_enabled,
+                       next_run_at, last_run_at, last_run_status, updated_at
+                FROM user_agent_settings WHERE user_id = ?
+            """, (user_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                now_str = datetime.now(timezone.utc).isoformat()
+                default_next = calculate_next_run("08:00", "UTC")
+                await cursor.execute("""
+                    INSERT INTO user_agent_settings (
+                        user_id, daily_run_enabled, preferred_time, timezone, permitted_sources,
+                        max_duration_seconds, max_tool_steps, kill_switch_enabled,
+                        next_run_at, last_run_at, last_run_status, updated_at
+                    ) VALUES (?, 0, '08:00', 'UTC', '["gmail","tasks","calendar"]', 120, 10, 0, ?, NULL, 'never_run', ?)
+                    ON CONFLICT(user_id) DO NOTHING
+                """, (user_id, default_next, now_str))
+                await cursor.execute("SELECT * FROM user_agent_settings WHERE user_id = ?", (user_id,))
+                row = cursor.fetchone()
+
+            if not row:
+                return {
+                    "user_id": user_id, "daily_run_enabled": 0, "preferred_time": "08:00",
+                    "timezone": "UTC", "permitted_sources": ["gmail", "tasks", "calendar"],
+                    "max_duration_seconds": 120, "max_tool_steps": 10, "kill_switch_enabled": 0,
+                    "next_run_at": None, "last_run_at": None, "last_run_status": "never_run"
+                }
+
+            d = dict(row)
+            try:
+                d["permitted_sources"] = json.loads(d["permitted_sources"])
+            except Exception:
+                d["permitted_sources"] = ["gmail", "tasks", "calendar"]
+            return d
+
+        return SettingsDict(coro=_fetch_d1())
+
+    # Synchronous SQLite mode
     cursor.execute("""
         SELECT user_id, daily_run_enabled, preferred_time, timezone, permitted_sources,
                max_duration_seconds, max_tool_steps, kill_switch_enabled,
@@ -38,24 +102,65 @@ def get_or_create_user_settings(user_id: str) -> Dict[str, Any]:
                 max_duration_seconds, max_tool_steps, kill_switch_enabled,
                 next_run_at, last_run_at, last_run_status, updated_at
             ) VALUES (?, 0, '08:00', 'UTC', '["gmail","tasks","calendar"]', 120, 10, 0, ?, NULL, 'never_run', ?)
+            ON CONFLICT(user_id) DO NOTHING
         """, (user_id, default_next, now_str))
-        conn.commit()
+        if hasattr(conn, "commit"):
+            conn.commit()
         cursor.execute("SELECT * FROM user_agent_settings WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
 
-    conn.close()
+    if hasattr(conn, "close"):
+        conn.close()
+
+    if not row:
+        return SettingsDict({
+            "user_id": user_id, "daily_run_enabled": 0, "preferred_time": "08:00",
+            "timezone": "UTC", "permitted_sources": ["gmail", "tasks", "calendar"],
+            "max_duration_seconds": 120, "max_tool_steps": 10, "kill_switch_enabled": 0,
+            "next_run_at": None, "last_run_at": None, "last_run_status": "never_run"
+        })
+
     d = dict(row)
     try:
         d["permitted_sources"] = json.loads(d["permitted_sources"])
     except Exception:
         d["permitted_sources"] = ["gmail", "tasks", "calendar"]
-    return d
+    return SettingsDict(d)
 
-def update_user_settings(user_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+def update_user_settings(user_id: str, settings: Dict[str, Any]) -> SettingsDict:
     """Updates user agent settings with validation."""
     conn = get_db()
     cursor = conn.cursor()
-    
+
+    if getattr(conn, "worker_env", None) and hasattr(conn.worker_env, "DB"):
+        async def _update_d1():
+            current = await get_or_create_user_settings(user_id)
+            enabled = int(bool(settings.get("daily_run_enabled", current.get("daily_run_enabled", 0))))
+            pref_time = settings.get("preferred_time", current.get("preferred_time", "08:00"))
+            tz_str = settings.get("timezone", current.get("timezone", "UTC"))
+            try:
+                ZoneInfo(tz_str)
+            except Exception:
+                tz_str = "UTC"
+            if not re.match(r"^\d{1,2}:\d{2}$", pref_time):
+                pref_time = "08:00"
+            sources = settings.get("permitted_sources", current.get("permitted_sources", ["gmail", "tasks", "calendar"]))
+            sources_json = json.dumps(sources) if isinstance(sources, list) else json.dumps(["gmail", "tasks", "calendar"])
+            kill_switch = int(bool(settings.get("kill_switch_enabled", current.get("kill_switch_enabled", 0))))
+            next_run = calculate_next_run(pref_time, tz_str) if enabled else None
+            now_str = datetime.now(timezone.utc).isoformat()
+
+            await cursor.execute("""
+                UPDATE user_agent_settings
+                SET daily_run_enabled = ?, preferred_time = ?, timezone = ?,
+                    permitted_sources = ?, kill_switch_enabled = ?,
+                    next_run_at = ?, updated_at = ?
+                WHERE user_id = ?
+            """, (enabled, pref_time, tz_str, sources_json, kill_switch, next_run, now_str, user_id))
+            return await get_or_create_user_settings(user_id)
+
+        return SettingsDict(coro=_update_d1())
+
     current = get_or_create_user_settings(user_id)
     enabled = int(bool(settings.get("daily_run_enabled", current["daily_run_enabled"])))
     pref_time = settings.get("preferred_time", current["preferred_time"])
@@ -85,8 +190,10 @@ def update_user_settings(user_id: str, settings: Dict[str, Any]) -> Dict[str, An
             next_run_at = ?, updated_at = ?
         WHERE user_id = ?
     """, (enabled, pref_time, tz_str, sources_json, kill_switch, next_run, now_str, user_id))
-    conn.commit()
-    conn.close()
+    if hasattr(conn, "commit"):
+        conn.commit()
+    if hasattr(conn, "close"):
+        conn.close()
 
     return get_or_create_user_settings(user_id)
 
