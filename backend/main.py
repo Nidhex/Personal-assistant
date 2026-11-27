@@ -590,6 +590,82 @@ def toggle_task(task_id: str, user: dict = Depends(get_current_user)):
     conn.close()
     return {"success": True, "completed": bool(new_val)}
 
+class UpdateTaskRequest(BaseModel):
+    title: Optional[str] = None
+    due_date: Optional[str] = None
+    priority: Optional[str] = None
+
+@app.patch("/api/user/tasks/{task_id}")
+def update_task(task_id: str, req: UpdateTaskRequest, user: dict = Depends(get_current_user)):
+    import uuid
+    if req.title is None and req.due_date is None and req.priority is None:
+        raise HTTPException(status_code=400, detail="At least one field must be provided.")
+
+    updates = {}
+    if req.title is not None:
+        cleaned_title = req.title.strip()
+        if not cleaned_title or len(cleaned_title) > 200:
+            raise HTTPException(status_code=400, detail="Title must be between 1 and 200 characters.")
+        updates["title"] = cleaned_title
+
+    if req.due_date is not None:
+        updates["due_date"] = req.due_date.strip() or "No due date"
+
+    if req.priority is not None:
+        if req.priority not in ("normal", "medium", "high"):
+            raise HTTPException(status_code=400, detail="Priority must be normal, medium, or high.")
+        updates["priority"] = req.priority
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, title, source, source_email_id, due_date, priority, completed, workspace, created_at FROM user_tasks WHERE id = ? AND user_id = ?",
+        (task_id, user["id"])
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+    values = list(updates.values()) + [task_id, user["id"]]
+    cursor.execute(f"UPDATE user_tasks SET {set_clause} WHERE id = ? AND user_id = ?", values)
+
+    new_title = updates.get("title", row["title"])
+    cursor.execute("""
+        INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+        VALUES (?, ?, 'Task edited', 'Completed', '0ms', ?, ?)
+    """, (f"act_{uuid.uuid4().hex}", user["id"], f"Edited task: {new_title}", datetime.now(timezone.utc).isoformat()))
+
+    cursor.execute(
+        "SELECT id, title, source, source_email_id, due_date, priority, completed, workspace, created_at FROM user_tasks WHERE id = ? AND user_id = ?",
+        (task_id, user["id"])
+    )
+    updated_row = dict(cursor.fetchone())
+    conn.commit()
+    conn.close()
+    return updated_row
+
+@app.delete("/api/user/tasks/{task_id}")
+def delete_task(task_id: str, user: dict = Depends(get_current_user)):
+    import uuid
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title FROM user_tasks WHERE id = ? AND user_id = ?", (task_id, user["id"]))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    cursor.execute("DELETE FROM user_tasks WHERE id = ? AND user_id = ?", (task_id, user["id"]))
+    cursor.execute("""
+        INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+        VALUES (?, ?, 'Task deleted', 'Completed', '0ms', ?, ?)
+    """, (f"act_{uuid.uuid4().hex}", user["id"], f"Deleted task: {row['title']}", datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
 class CreateWorkspaceRequest(BaseModel):
     name: str
     type: str = "General"

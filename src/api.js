@@ -125,6 +125,30 @@ export async function toggleUserTask(taskId) {
   return await res.json()
 }
 
+export async function updateUserTask(taskId, fields) {
+  const res = await fetch(`/api/user/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fields)
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to update task')
+  }
+  return await res.json()
+}
+
+export async function deleteUserTask(taskId) {
+  const res = await fetch(`/api/user/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE'
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to delete task')
+  }
+  return await res.json()
+}
+
 export async function createUserWorkspace(ws) {
   const res = await fetch('/api/user/workspaces', {
     method: 'POST',
