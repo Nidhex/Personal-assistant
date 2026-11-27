@@ -44,6 +44,8 @@ import WorkspacesChatView from './views/WorkspacesChatView'
 import ActivityTraceView from './views/ActivityTraceView'
 import DailyDigestView from './views/DailyDigestView'
 import AccountsSettingsView from './views/AccountsSettingsView'
+import PrivacyView from './views/PrivacyView'
+import TermsView from './views/TermsView'
 
 export default function App() {
   const [authLoading, setAuthLoading] = useState(true)
@@ -59,6 +61,20 @@ export default function App() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
   const [toastMessage, setToastMessage] = useState(null)
   const [killSwitchActive, setKillSwitchActive] = useState(false)
+  const [currentPath, setCurrentPath] = useState(window.location.pathname)
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setCurrentPath(window.location.pathname)
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  const navigate = (path) => {
+    window.history.pushState({}, '', path)
+    setCurrentPath(path)
+  }
 
   // Real Data State
   const [emails, setEmails] = useState([])
@@ -187,6 +203,14 @@ export default function App() {
   const unreadEmailsCount = emails ? emails.filter(e => e.isUnread).length : 0
   const pendingTasksCount = tasks ? tasks.filter(t => !t.completed).length : 0
 
+  // Unauthenticated Public Routes (Privacy Policy & Terms of Service)
+  if (currentPath === '/privacy') {
+    return <PrivacyView onNavigate={navigate} />
+  }
+  if (currentPath === '/terms') {
+    return <TermsView onNavigate={navigate} />
+  }
+
   // Loading Screen in Warm Ivory / Minimal Style
   if (authLoading) {
     return (
@@ -209,6 +233,7 @@ export default function App() {
         onAuthSuccess={loadAuthAndUser}
         showToast={showToast}
         authError={authError}
+        onNavigate={navigate}
       />
     )
   }

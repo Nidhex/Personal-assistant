@@ -23,7 +23,7 @@
     "ENVIRONMENT": "production",
     "COOKIE_SECURE": "true",
     "DEV_TEST_MODE": "false",
-    "FRONTEND_URL": "https://deskagent.pages.dev",
-    "GOOGLE_REDIRECT_URI": "https://deskagent-backend.hacckthon.workers.dev/api/auth/google/callback"
+    "FRONTEND_URL": "https://deskagent.hacckthon.workers.dev",
+    "GOOGLE_REDIRECT_URI": "https://deskagent.hacckthon.workers.dev/api/auth/google/callback"
   }
 }

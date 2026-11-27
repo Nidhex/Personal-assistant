@@ -12,7 +12,8 @@ export default function LoginView({
   authStatus,
   onAuthSuccess,
   showToast,
-  authError
+  authError,
+  onNavigate
 }) {
   const [loading, setLoading] = useState(false)
   const [devLoading, setDevLoading] = useState(false)
@@ -164,6 +165,32 @@ export default function LoginView({
               </button>
             </div>
           )}
+          {/* Public Policy & Terms Footer */}
+          <div className="pt-4 border-t border-[#DEDAD0] flex items-center justify-center gap-4 text-xs">
+            <a
+              href="/privacy"
+              onClick={(e) => {
+                e.preventDefault()
+                if (onNavigate) onNavigate('/privacy')
+                else window.location.href = '/privacy'
+              }}
+              className="text-[#4B5563] hover:text-[#242424] hover:underline transition-colors cursor-pointer"
+            >
+              Privacy Policy
+            </a>
+            <span className="text-[#DEDAD0]">•</span>
+            <a
+              href="/terms"
+              onClick={(e) => {
+                e.preventDefault()
+                if (onNavigate) onNavigate('/terms')
+                else window.location.href = '/terms'
+              }}
+              className="text-[#4B5563] hover:text-[#242424] hover:underline transition-colors cursor-pointer"
+            >
+              Terms of Service
+            </a>
+          </div>
         </div>
       </div>
     </div>

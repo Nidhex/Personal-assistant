@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -65,8 +65,10 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "https://deskagent.pages.dev",
+        "https://deskagent.hacckthon.workers.dev",
+        "https://deskagent-backend.hacckthon.workers.dev",
     ],
-    allow_origin_regex=r"^https://.*\.pages\.dev$",
+    allow_origin_regex=r"^https://.*(\.pages\.dev|\.workers\.dev)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -151,6 +153,204 @@ def get_current_user(request: Request) -> dict:
             detail="Authentication required. Please sign in."
         )
     return user
+
+# -------------------------------------------------------------
+# PUBLIC POLICY & VERIFICATION ROUTES
+# -------------------------------------------------------------
+PRIVACY_POLICY_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Privacy Policy - Personal AI Assistant</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #F7F4EB; color: #242424; margin: 0; padding: 24px; line-height: 1.6; }
+    .container { max-width: 820px; margin: 0 auto; }
+    .nav { margin-bottom: 24px; }
+    .btn { display: inline-block; background-color: #FFFDF8; color: #242424; border: 1px solid #DEDAD0; padding: 8px 16px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: 500; }
+    .card { background-color: #FFFDF8; border: 1px solid #DEDAD0; border-radius: 16px; padding: 28px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    h1 { margin-top: 0; font-size: 26px; color: #242424; }
+    h2 { font-size: 16px; color: #242424; margin-top: 0; border-bottom: 1px solid #EFECE2; padding-bottom: 8px; }
+    p, li { font-size: 13px; color: #4B5563; }
+    code { background-color: #EFECE2; padding: 2px 6px; border-radius: 4px; font-size: 12px; font-family: monospace; }
+    .badge { display: inline-block; background-color: #E9DB91; color: #854D0E; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px; margin-bottom: 12px; }
+    .footer { text-align: center; font-size: 12px; color: #6B7280; padding: 24px 0; border-top: 1px solid #DEDAD0; }
+    a { color: #854D0E; text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="nav">
+      <a href="/" class="btn">&larr; Back to Application</a>
+    </div>
+    <div class="card">
+      <span class="badge">Official Policy Document</span>
+      <h1>Privacy Policy</h1>
+      <p><strong>Last Updated:</strong> November 2026 &bull; Applies to Personal AI Assistant</p>
+      <p>Personal AI Assistant ("we", "our", or "the Application") is a personal productivity web application designed to help individual users manage tasks, audit schedule conflicts, plan projects, organize study notes, and summarize incoming communications. We maintain strict policies regarding user privacy and sensitive data protection.</p>
+    </div>
+
+    <div class="card">
+      <h2>1. Google OAuth 2.0 & Identity Data Collection</h2>
+      <p>When you authenticate with Personal AI Assistant via Google OAuth 2.0, we request access to basic identity scopes:</p>
+      <ul>
+        <li><code>openid</code>: Unique identifier verification</li>
+        <li><code>https://www.googleapis.com/auth/userinfo.email</code>: Primary email address</li>
+        <li><code>https://www.googleapis.com/auth/userinfo.profile</code>: Display name and avatar URL</li>
+      </ul>
+      <p>This identity data is used exclusively to authenticate your session and isolate your personal workspace. We do not sell, rent, or monetize your personal information.</p>
+    </div>
+
+    <div class="card">
+      <h2>2. Gmail Read-Only Access & Limited Use Disclosure</h2>
+      <p>With your explicit authorization, the Application requests the read-only Gmail scope:</p>
+      <p><code>https://www.googleapis.com/auth/gmail.readonly</code></p>
+      <p><strong>Purpose of Access:</strong> Gmail read-only access is used exclusively to fetch message subject lines, sender metadata, timestamps, and message snippets so you can review incoming communications inside your personal dashboard and allow the Assistant to propose actionable task items.</p>
+      <p><strong>Scope Limitations:</strong> We do NOT request permissions to compose, send, modify, forward, archive, or delete your emails. The access is strictly read-only.</p>
+      <p><strong>Supervised Human-in-the-Loop Policy:</strong> The Assistant NEVER takes autonomous external actions without your explicit review and approval in the Approvals panel.</p>
+      <p><strong>Compliance with Google Limited Use Policy:</strong> Personal AI Assistant's use and transfer to any other app of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noopener noreferrer">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+      <p>We do not use Google user data to serve advertisements, train generalized third-party machine learning models, or transfer data to data brokers.</p>
+    </div>
+
+    <div class="card">
+      <h2>3. Data Storage, Architecture & Strict User Isolation</h2>
+      <p>All application data is stored in Cloudflare D1, a distributed serverless SQLite database hosted on Cloudflare's global infrastructure:</p>
+      <ul>
+        <li><strong>Strict User Isolation:</strong> Every database table enforces foreign key constraints and user isolation predicates (<code>user_id = ?</code>). One user cannot view, modify, or delete another user's tasks, calendar events, notes, or execution logs.</li>
+        <li><strong>Local Development Data:</strong> In local development mode, a local SQLite database file (<code>backend/data.db</code>) is used and never synced to public repositories.</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>4. Encryption of Credentials and Sensitive Tokens</h2>
+      <p>OAuth access and refresh tokens returned by Google are encrypted at rest using <strong>Fernet symmetric cryptography</strong> (AES-128-CBC with HMAC-SHA256 authenticated encryption) before being inserted into the database:</p>
+      <ul>
+        <li>Tokens are never written to database tables or logs in plaintext format.</li>
+        <li>Encryption keys are stored as encrypted environment secrets on Cloudflare Workers and are never exposed in source code.</li>
+        <li>Decrypted tokens exist only transiently in worker memory during the active execution of authorized user requests.</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>5. Data Retention, Revocation & Deletion Rights</h2>
+      <p><strong>Session Expiration:</strong> Browser session cookies are HTTP-only, secure, and configured with a 7-day lifespan. OAuth CSRF state parameters expire after 10 minutes.</p>
+      <p><strong>Disconnecting Gmail:</strong> You can disconnect your Gmail account at any time directly within the application by navigating to <em>Connected Accounts &gt; Disconnect Gmail</em>. Disconnecting immediately revokes the token with Google and removes the encrypted token from our database.</p>
+      <p><strong>Revoking via Google:</strong> You can independently revoke access at any time through your <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener noreferrer">Google Security Settings (Third-party apps with account access)</a>.</p>
+      <p><strong>Account & Data Deletion Requests:</strong> If you wish to delete your user record and all associated tasks, events, and notes from our database, send a request to our administrative contact at <code>nidsvaishnav10@gmail.com</code>. Deletion requests are processed promptly.</p>
+    </div>
+
+    <div class="card">
+      <h2>6. Contact Information</h2>
+      <p>For privacy-related inquiries, data requests, or questions regarding our Google OAuth integration, please contact:</p>
+      <p><strong>Application:</strong> Personal AI Assistant<br>
+      <strong>Administrator:</strong> Nidhish Vaishnav<br>
+      <strong>Email:</strong> <a href="mailto:nidsvaishnav10@gmail.com">nidsvaishnav10@gmail.com</a><br>
+      <strong>Deployment:</strong> Cloudflare Workers &amp; Pages</p>
+    </div>
+
+    <div class="footer">
+      &copy; 2026 Personal AI Assistant. All rights reserved. &bull; <a href="/terms">Terms of Service</a>
+    </div>
+  </div>
+</body>
+</html>"""
+
+TERMS_OF_SERVICE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Terms of Service - Personal AI Assistant</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #F7F4EB; color: #242424; margin: 0; padding: 24px; line-height: 1.6; }
+    .container { max-width: 820px; margin: 0 auto; }
+    .nav { margin-bottom: 24px; }
+    .btn { display: inline-block; background-color: #FFFDF8; color: #242424; border: 1px solid #DEDAD0; padding: 8px 16px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: 500; }
+    .card { background-color: #FFFDF8; border: 1px solid #DEDAD0; border-radius: 16px; padding: 28px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    h1 { margin-top: 0; font-size: 26px; color: #242424; }
+    h2 { font-size: 16px; color: #242424; margin-top: 0; border-bottom: 1px solid #EFECE2; padding-bottom: 8px; }
+    p, li { font-size: 13px; color: #4B5563; }
+    code { background-color: #EFECE2; padding: 2px 6px; border-radius: 4px; font-size: 12px; font-family: monospace; }
+    .badge { display: inline-block; background-color: #E9DB91; color: #854D0E; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px; margin-bottom: 12px; }
+    .footer { text-align: center; font-size: 12px; color: #6B7280; padding: 24px 0; border-top: 1px solid #DEDAD0; }
+    a { color: #854D0E; text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="nav">
+      <a href="/" class="btn">&larr; Back to Application</a>
+    </div>
+    <div class="card">
+      <span class="badge">Terms of Service</span>
+      <h1>Terms of Service</h1>
+      <p><strong>Last Updated:</strong> November 2026 &bull; Applies to Personal AI Assistant</p>
+      <p>Please read these Terms of Service ("Terms") carefully before using the Personal AI Assistant web application ("Application", "Service"). By accessing or using the Application, you agree to be bound by these Terms. If you do not agree to these Terms, do not use the Application.</p>
+    </div>
+
+    <div class="card">
+      <h2>1. Description of Application Services</h2>
+      <p>Personal AI Assistant is an interactive productivity software designed for individual personal productivity and study workflows. Core features include:</p>
+      <ul>
+        <li><strong>Task Management:</strong> Creating, prioritizing, editing, and completing personal tasks.</li>
+        <li><strong>Calendar Conflict Auditing:</strong> Organizing calendar events and auditing conflicting schedules.</li>
+        <li><strong>Study Workspaces:</strong> Organizing study materials, revision plans, and structured notes derived from YouTube educational transcripts.</li>
+        <li><strong>Supervised Email Task Proposals:</strong> Inspecting incoming Gmail messages with read-only access to propose actionable task items.</li>
+        <li><strong>Daily Briefing Digests:</strong> Summarizing pending priorities and inbox activity on demand or on a scheduled basis.</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>2. AI-Generated Content &amp; Human-in-the-Loop Supervision</h2>
+      <p><strong>Informational Purposes Only:</strong> The Application uses artificial intelligence models to assist with project planning, email summarization, and study assistance. All AI outputs, summaries, suggestions, and proposed action items are provided strictly for informational and planning purposes.</p>
+      <p><strong>Mandatory User Review:</strong> You acknowledge that you are responsible for reviewing and verifying the accuracy of any task or action proposal. The Assistant does not execute destructive or irreversible external actions without explicit user approval through the Approvals review gate.</p>
+      <p><strong>Emergency Kill Switch:</strong> The Application includes an emergency Kill Switch accessible from the Activity &amp; Trace and Daily Briefing views. Engaging the Kill Switch immediately halts scheduled and background agent runs.</p>
+    </div>
+
+    <div class="card">
+      <h2>3. User Responsibilities &amp; Acceptable Use</h2>
+      <p>When using Personal AI Assistant, you agree to:</p>
+      <ul>
+        <li>Use the Application solely for lawful personal productivity purposes.</li>
+        <li>Maintain the security of your Google account and credentials.</li>
+        <li>Not attempt to reverse-engineer, decompile, probe, or compromise the Application infrastructure, database, or other users' accounts.</li>
+        <li>Not use automated scripts to abuse, rate-limit, or overload upstream APIs (including YouTube, Google APIs, and Cloudflare Workers).</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>4. Service Availability &amp; As-Is Disclaimer</h2>
+      <p>The Application is provided on an <strong>"AS IS"</strong> and <strong>"AS AVAILABLE"</strong> basis without warranties of any kind, whether express, statutory, or implied.</p>
+      <p>We do not warrant that the Service will be uninterrupted, error-free, completely secure, or free of defects. Service availability is dependent upon third-party providers including Cloudflare infrastructure, Google OAuth and Gmail APIs, and YouTube caption services.</p>
+      <p>We reserve the right to modify, update, suspend, or discontinue the Application or any specific feature at any time without prior notice.</p>
+    </div>
+
+    <div class="card">
+      <h2>5. Limitation of Liability</h2>
+      <p>To the maximum extent permitted by applicable law, the developers, contributors, and operators of Personal AI Assistant shall not be liable for any direct, indirect, incidental, exemplary, special, or consequential damages, including loss of data, loss of business, or service interruptions arising out of or in connection with your use of the Application.</p>
+    </div>
+
+    <div class="card">
+      <h2>6. Governing Law &amp; Contact</h2>
+      <p>For questions or notices regarding these Terms, contact our administrative administrator at <a href="mailto:nidsvaishnav10@gmail.com">nidsvaishnav10@gmail.com</a>.</p>
+    </div>
+
+    <div class="footer">
+      &copy; 2026 Personal AI Assistant. All rights reserved. &bull; <a href="/privacy">Privacy Policy</a>
+    </div>
+  </div>
+</body>
+</html>"""
+
+@app.get("/privacy", response_class=HTMLResponse)
+def get_privacy_page():
+    """Publicly accessible privacy policy page for users and Google OAuth verification."""
+    return HTMLResponse(content=PRIVACY_POLICY_HTML, status_code=200)
+
+@app.get("/terms", response_class=HTMLResponse)
+def get_terms_page():
+    """Publicly accessible terms of service page for users and Google OAuth verification."""
+    return HTMLResponse(content=TERMS_OF_SERVICE_HTML, status_code=200)
 
 # -------------------------------------------------------------
 # AUTH & OAUTH ROUTES

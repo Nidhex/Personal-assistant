@@ -1,6 +1,6 @@
 // Frontend API client for backend authentication and Gmail operations
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? 'https://deskagent-backend.hacckthon.workers.dev' : '')
+const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 async function apiFetch(url, options = {}) {
   const fullUrl = url.startsWith('/') ? `${API_BASE}${url}` : url
