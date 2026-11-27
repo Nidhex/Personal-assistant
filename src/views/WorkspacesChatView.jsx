@@ -32,8 +32,10 @@ import {
 } from '../api'
 
 // Simple helper to render basic markdown elements (headers, bold, lists, code blocks)
-function formatMessageContent(content) {
+function formatMessageContent(content, isAssistant = true) {
   if (!content) return ''
+  const headingText = isAssistant ? 'text-[#242424]' : 'text-[#FFFDF8]'
+  const bodyText = isAssistant ? 'text-[#374151]' : 'text-[#FFFDF8]'
   const lines = content.split('\n')
   const formatted = []
   let inCodeBlock = false
@@ -65,19 +67,19 @@ function formatMessageContent(content) {
 
     if (line.startsWith('### ')) {
       formatted.push(
-        <h4 key={idx} className="font-semibold text-xs text-[#242424] mt-2 mb-1">
+        <h4 key={idx} className={`font-semibold text-xs ${headingText} mt-2 mb-1`}>
           {line.replace('### ', '')}
         </h4>
       )
     } else if (line.startsWith('## ')) {
       formatted.push(
-        <h3 key={idx} className="font-semibold text-sm text-[#242424] mt-2 mb-1">
+        <h3 key={idx} className={`font-semibold text-sm ${headingText} mt-2 mb-1`}>
           {line.replace('## ', '')}
         </h3>
       )
     } else if (line.startsWith('- ') || line.startsWith('* ')) {
       formatted.push(
-        <li key={idx} className="ml-4 list-disc text-xs text-[#374151] my-0.5 leading-relaxed">
+        <li key={idx} className={`ml-4 list-disc text-xs ${bodyText} my-0.5 leading-relaxed`}>
           {line.substring(2)}
         </li>
       )
@@ -279,6 +281,14 @@ export default function WorkspacesChatView({
           res.user_message,
           res.assistant_message
         ])
+        let meta = res.assistant_message.metadata
+        if (typeof meta === 'string') {
+          try { meta = JSON.parse(meta) } catch { meta = null }
+        }
+        if (meta && (meta.tool_executed || meta.approval_required)) {
+          window.dispatchEvent(new CustomEvent('pa:data-changed'))
+          if (onWorkspacesChanged) onWorkspacesChanged()
+        }
       }
     } catch (err) {
       showToast(err.message || 'Error communicating with assistant.')
@@ -688,7 +698,7 @@ export default function WorkspacesChatView({
                             : 'bg-[#242424] text-[#FFFDF8]'
                         }`}
                       >
-                        {formatMessageContent(msg.content)}
+                        {formatMessageContent(msg.content, isAssistant)}
                       </div>
 
                       {/* Tool Execution or Policy Status Badge */}

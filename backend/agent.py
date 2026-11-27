@@ -33,7 +33,8 @@ ALLOWED_TOOLS = [
     "create_revision_plan",
     "convert_plan_to_tasks",
     "generate_quiz_questions",
-    "propose_draft"
+    "propose_draft",
+    "propose_task"
 ]
 
 # -------------------------------------------------------------
@@ -353,7 +354,7 @@ Calendar Events:
 {{
   "response": "Brief explanation to user",
   "action": {{
-    "tool": "create_task" | "list_tasks" | "complete_task" | "reopen_task" | "list_calendar_events" | "check_calendar_conflicts" | "schedule_event" | "read_gmail" | "extract_email_tasks" | "process_youtube_notes" | "create_revision_plan" | "convert_plan_to_tasks" | "generate_quiz_questions" | "propose_draft",
+    "tool": "create_task" | "list_tasks" | "complete_task" | "reopen_task" | "list_calendar_events" | "check_calendar_conflicts" | "schedule_event" | "read_gmail" | "extract_email_tasks" | "process_youtube_notes" | "create_revision_plan" | "convert_plan_to_tasks" | "generate_quiz_questions" | "propose_draft" | "propose_task",
     "parameters": {{ ... }}
   }}
 }}
@@ -361,6 +362,7 @@ Calendar Events:
 4. Never schedule calendar events over a conflicting event.
 5. Practice questions and answers must be grounded strictly in the user's uploaded notes.
 6. Direct email sending is forbidden without human approval (propose_draft stages into approvals queue).
+7. Tasks derived from email must use propose_task (with title, due_date, priority, workspace, source_email_id) rather than create_task.
 </security_policy>
 """
 
@@ -648,7 +650,8 @@ async def execute_policy_gate_and_tools(
     model_output: str,
     user_id: str,
     workspace_id: Optional[str],
-    kill_switch_active: bool
+    kill_switch_active: bool,
+    email_derived: bool = False
 ) -> Dict[str, Any]:
     """
     Parses planner output, validates policy rules, executes authorized tools,
@@ -733,6 +736,7 @@ async def execute_policy_gate_and_tools(
         conn.close()
 
         result["approval_required"] = True
+        result["approval_id"] = approval_id
         result["policy_decision"] = "Queued: Staged in Human Approval Queue"
         result["tool_executed"] = "propose_draft"
         result["text"] = f"I have prepared the draft response and placed it in your **Approvals** inbox (ID: `{approval_id}`). Outbound emails remain strictly paused until you review and approve them."
@@ -747,6 +751,76 @@ async def execute_policy_gate_and_tools(
             ws_name = r["name"]
 
     latency_ms = f"{int((time.time() - start_time) * 1000)}ms"
+
+    if tool_name == "propose_task":
+        raw_title = params.get("title", "").strip() or "New Proposed Task"
+        raw_due = params.get("due_date", "Today")
+        priority = params.get("priority", "normal")
+        if priority not in ("normal", "high"):
+            priority = "normal"
+        target_ws = params.get("workspace") or ws_name
+        source_email_id = params.get("source_email_id")
+        due_date = parse_relative_date(raw_due)
+
+        payload = {
+            "title": raw_title,
+            "due_date": due_date,
+            "priority": priority,
+            "workspace": target_ws,
+            "source_email_id": source_email_id,
+        }
+        approval_id = f"appr_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        email_subject = params.get("subject") or raw_title
+        cursor.execute("""
+            INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
+            VALUES (?, ?, 'Task Proposal', ?, ?, ?, 'Low', ?, 'pending', ?)
+        """, (
+            approval_id,
+            user_id,
+            raw_title,
+            f"Task from email: {email_subject}",
+            params.get("reason", "Email-derived task requires human approval before creation."),
+            json.dumps(payload),
+            datetime.now(timezone.utc).isoformat()
+        ))
+        cursor.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, ?, 'Completed', ?, ?, ?)
+        """, (
+            f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+            user_id,
+            f"Tool: propose_task",
+            latency_ms,
+            "Task proposal queued",
+            datetime.now(timezone.utc).isoformat()
+        ))
+        conn.commit()
+        conn.close()
+
+        result["approval_required"] = True
+        result["approval_id"] = approval_id
+        result["policy_decision"] = "Queued: Staged in Human Approval Queue"
+        result["tool_executed"] = "propose_task"
+        result["text"] = f"I have queued the task proposal **'{raw_title}'** in your **Approvals** inbox (ID: `{approval_id}`)."
+        return result
+
+    if email_derived and tool_name == "create_task":
+        result["policy_decision"] = "Refused: email-derived tasks require approval via propose_task"
+        result["text"] = "Security Refusal: Email-derived tasks require human approval via propose_task."
+        cursor.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, ?, 'Refused', ?, ?, ?)
+        """, (
+            f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+            user_id,
+            "Tool: create_task",
+            latency_ms,
+            "Refused: email-derived tasks require approval via propose_task",
+            datetime.now(timezone.utc).isoformat()
+        ))
+        conn.commit()
+        conn.close()
+        return result
 
     # =========================================================
     # TASK TOOLS
@@ -981,7 +1055,20 @@ async def execute_policy_gate_and_tools(
         try:
             mail_data = await fetch_gmail_messages(user_id=user_id, max_results=params.get("max_results", 10))
             messages = mail_data.get("messages", [])
-            tasks_created = []
+            proposals_queued = []
+
+            # Preload pending Task Proposals for this user to dedupe without dropping distinct items
+            cursor.execute(
+                "SELECT target, draft_content FROM user_approvals WHERE user_id = ? AND type = 'Task Proposal' AND status = 'pending'",
+                (user_id,)
+            )
+            pending_keys = set()
+            for row in cursor.fetchall():
+                try:
+                    dc = json.loads(row["draft_content"] or "{}")
+                except Exception:
+                    dc = {}
+                pending_keys.add((dc.get("source_email_id"), (dc.get("title") or row["target"] or "").strip().lower()))
 
             for m in messages:
                 subject = m.get("subject", "")
@@ -993,36 +1080,68 @@ async def execute_policy_gate_and_tools(
                 if not has_deadline:
                     continue
 
-                # Check duplicate
                 msg_id = m.get("id")
-                cursor.execute("SELECT id FROM user_tasks WHERE user_id = ? AND source_email_id = ?", (user_id, msg_id))
-                if cursor.fetchone():
-                    continue
-
                 clean_title = f"Review: {subject[:50]}"
                 task_due = "tomorrow" if "tomorrow" in full_text else "Friday"
                 parsed_due = parse_relative_date(task_due)
-                task_id = f"tsk_email_{int(time.time()*1000)}_{os.urandom(2).hex()}"
 
+                # Dedupe against existing tasks for this user & email+title
+                cursor.execute(
+                    "SELECT id FROM user_tasks WHERE user_id = ? AND source_email_id = ? AND lower(title) = lower(?)",
+                    (user_id, msg_id, clean_title)
+                )
+                if cursor.fetchone():
+                    continue
+
+                # Dedupe against pending Task Proposals
+                if (msg_id, clean_title.lower()) in pending_keys:
+                    continue
+
+                payload = {
+                    "title": clean_title,
+                    "due_date": parsed_due,
+                    "priority": "high",
+                    "workspace": ws_name,
+                    "source_email_id": msg_id,
+                }
+                approval_id = f"appr_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+                sender_name = m.get("senderName", "Email")
                 cursor.execute("""
-                    INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
-                    VALUES (?, ?, ?, 'Gmail Deadline', ?, ?, 'high', 0, ?, ?)
-                """, (task_id, user_id, clean_title, msg_id, parsed_due, ws_name, datetime.now(timezone.utc).isoformat()))
-                tasks_created.append(f"**{clean_title}** (Due: {parsed_due}, from: {m.get('senderName', 'Email')})")
+                    INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
+                    VALUES (?, ?, 'Task Proposal', ?, ?, ?, 'Low', ?, 'pending', ?)
+                """, (
+                    approval_id,
+                    user_id,
+                    clean_title,
+                    f"Task from email: {subject or clean_title}",
+                    f"Detected deadline/action item in email from {sender_name}.",
+                    json.dumps(payload),
+                    datetime.now(timezone.utc).isoformat()
+                ))
+                pending_keys.add((msg_id, clean_title.lower()))
+                proposals_queued.append(f"**{clean_title}** (Due: {parsed_due}, from: {sender_name}, ID: `{approval_id}`)")
 
             cursor.execute("""
                 INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
                 VALUES (?, ?, 'Extract Email Deadlines', 'Completed', ?, ?, ?)
-            """, (f"act_{int(time.time()*1000)}", user_id, latency_ms, f"Created {len(tasks_created)} tasks from emails", datetime.now(timezone.utc).isoformat()))
+            """, (
+                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                user_id,
+                latency_ms,
+                f"Queued {len(proposals_queued)} task proposals from emails",
+                datetime.now(timezone.utc).isoformat()
+            ))
             conn.commit()
             conn.close()
 
             result["tool_executed"] = "extract_email_tasks"
-            result["policy_decision"] = "Allowed & Executed"
-            if tasks_created:
-                result["text"] = "### Extracted Email Deadlines:\n" + "\n".join([f"- {t}" for t in tasks_created])
+            if proposals_queued:
+                result["approval_required"] = True
+                result["policy_decision"] = "Queued: Staged in Human Approval Queue"
+                result["text"] = "### Queued Email Task Proposals (Pending Approval):\n" + "\n".join([f"- {t}" for t in proposals_queued])
             else:
-                result["text"] = "Scanned recent inbox messages. No new deadline action items required task creation, or tasks already exist."
+                result["policy_decision"] = "Allowed & Executed"
+                result["text"] = "Scanned recent inbox messages. No new deadline action items required task proposals, or proposals/tasks already exist."
             return result
         except Exception as e:
             conn.close()
