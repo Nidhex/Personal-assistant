@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Query, status
@@ -521,3 +523,273 @@ def handle_approval_action(approval_id: str, req: ApprovalActionRequest, user: d
     conn.commit()
     conn.close()
     return {"success": True, "status": new_status}
+
+# -------------------------------------------------------------
+# CHAT & CONVERSATION ENDPOINTS (USER & WORKSPACE ISOLATED)
+# -------------------------------------------------------------
+from .agent import build_context, query_llm_planner, execute_policy_gate_and_tools
+
+class CreateConversationRequest(BaseModel):
+    title: Optional[str] = "New Conversation"
+    workspace_id: Optional[str] = None
+
+@app.get("/api/chat/conversations")
+def list_conversations(
+    workspace_id: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    """Lists conversations for the authenticated user, optionally scoped to a workspace."""
+    conn = get_db()
+    cursor = conn.cursor()
+    if workspace_id and workspace_id != "main":
+        cursor.execute("""
+            SELECT id, user_id, workspace_id, title, created_at, updated_at
+            FROM conversations
+            WHERE user_id = ? AND workspace_id = ?
+            ORDER BY updated_at DESC
+        """, (user["id"], workspace_id))
+    else:
+        cursor.execute("""
+            SELECT id, user_id, workspace_id, title, created_at, updated_at
+            FROM conversations
+            WHERE user_id = ? AND (workspace_id IS NULL OR workspace_id = 'main')
+            ORDER BY updated_at DESC
+        """, (user["id"],))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"conversations": rows}
+
+@app.post("/api/chat/conversations")
+def create_conversation(
+    req: CreateConversationRequest,
+    user: dict = Depends(get_current_user)
+):
+    """Creates a persistent conversation for the user, linked to an optional workspace."""
+    conv_id = f"conv_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    now_str = datetime.now(timezone.utc).isoformat()
+    ws_id = req.workspace_id if req.workspace_id and req.workspace_id != "main" else None
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO conversations (id, user_id, workspace_id, title, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (conv_id, user["id"], ws_id, req.title or "New Conversation", now_str, now_str))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "conversation": {
+            "id": conv_id,
+            "user_id": user["id"],
+            "workspace_id": ws_id,
+            "title": req.title or "New Conversation",
+            "created_at": now_str,
+            "updated_at": now_str
+        }
+    }
+
+@app.get("/api/chat/conversations/{conversation_id}/messages")
+def get_conversation_messages(
+    conversation_id: str,
+    user: dict = Depends(get_current_user)
+):
+    """Retrieves message history for a specific conversation owned by the user."""
+    conn = get_db()
+    cursor = conn.cursor()
+    # Enforce ownership
+    cursor.execute("SELECT id, workspace_id, title FROM conversations WHERE id = ? AND user_id = ?", (conversation_id, user["id"]))
+    conv = cursor.fetchone()
+    if not conv:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
+
+    cursor.execute("""
+        SELECT id, conversation_id, role, content, metadata, created_at
+        FROM messages
+        WHERE conversation_id = ? AND user_id = ?
+        ORDER BY created_at ASC
+    """, (conversation_id, user["id"]))
+    msgs = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    return {
+        "conversation": dict(conv),
+        "messages": msgs
+    }
+
+class SendMessageRequest(BaseModel):
+    content: str
+    kill_switch_active: Optional[bool] = False
+
+@app.post("/api/chat/conversations/{conversation_id}/messages")
+async def send_chat_message(
+    conversation_id: str,
+    req: SendMessageRequest,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Submits a message into the persistent conversation:
+    1. Records user message in database
+    2. Builds scoped context
+    3. Runs LLM Planner
+    4. Evaluates Policy Gate & Tool Runner
+    5. Records assistant reply and execution metadata in database
+    """
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Message content cannot be empty.")
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Enforce conversation ownership
+    cursor.execute("SELECT id, workspace_id, title FROM conversations WHERE id = ? AND user_id = ?", (conversation_id, user["id"]))
+    conv = cursor.fetchone()
+    if not conv:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
+
+    workspace_id = conv["workspace_id"]
+    now_str = datetime.now(timezone.utc).isoformat()
+    user_msg_id = f"msg_{int(time.time()*1000)}_u"
+
+    # Save user message
+    cursor.execute("""
+        INSERT INTO messages (id, conversation_id, user_id, workspace_id, role, content, metadata, created_at)
+        VALUES (?, ?, ?, ?, 'user', ?, NULL, ?)
+    """, (user_msg_id, conversation_id, user["id"], workspace_id, req.content.strip(), now_str))
+    conn.commit()
+
+    # Build authorized scoped context
+    context = build_context(user["id"], workspace_id=workspace_id, conversation_id=conversation_id)
+
+    # Run Planner
+    raw_planner_output = await query_llm_planner(req.content.strip(), context)
+
+    # Run Policy Gate & Tool Runner
+    execution_result = await execute_policy_gate_and_tools(
+        model_output=raw_planner_output,
+        user_id=user["id"],
+        workspace_id=workspace_id,
+        kill_switch_active=bool(req.kill_switch_active)
+    )
+
+    assistant_msg_id = f"msg_{int(time.time()*1000)}_a"
+    asst_now = datetime.now(timezone.utc).isoformat()
+    metadata_json = json.dumps({
+        "policy_decision": execution_result["policy_decision"],
+        "tool_executed": execution_result["tool_executed"],
+        "approval_required": execution_result["approval_required"]
+    })
+
+    # Save assistant reply
+    cursor.execute("""
+        INSERT INTO messages (id, conversation_id, user_id, workspace_id, role, content, metadata, created_at)
+        VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?)
+    """, (assistant_msg_id, conversation_id, user["id"], workspace_id, execution_result["text"], metadata_json, asst_now))
+
+    # Update conversation title if first message
+    cursor.execute("SELECT COUNT(*) as count FROM messages WHERE conversation_id = ?", (conversation_id,))
+    cnt_row = cursor.fetchone()
+    if cnt_row and cnt_row["count"] <= 2 and (conv["title"] == "New Conversation" or not conv["title"]):
+        new_title = req.content.strip()[:35] + ("..." if len(req.content.strip()) > 35 else "")
+        cursor.execute("UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?", (new_title, asst_now, conversation_id))
+    else:
+        cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (asst_now, conversation_id))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "user_message": {
+            "id": user_msg_id,
+            "role": "user",
+            "content": req.content.strip(),
+            "created_at": now_str
+        },
+        "assistant_message": {
+            "id": assistant_msg_id,
+            "role": "assistant",
+            "content": execution_result["text"],
+            "metadata": metadata_json,
+            "created_at": asst_now
+        }
+    }
+
+@app.delete("/api/chat/conversations/{conversation_id}")
+def delete_conversation(
+    conversation_id: str,
+    user: dict = Depends(get_current_user)
+):
+    """Deletes a conversation and its messages, enforcing user ownership."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM conversations WHERE id = ? AND user_id = ?", (conversation_id, user["id"]))
+    if not cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
+
+    cursor.execute("DELETE FROM messages WHERE conversation_id = ? AND user_id = ?", (conversation_id, user["id"]))
+    cursor.execute("DELETE FROM conversations WHERE id = ? AND user_id = ?", (conversation_id, user["id"]))
+    conn.commit()
+    conn.close()
+
+    return {"success": True, "message": "Conversation deleted."}
+
+# -------------------------------------------------------------
+# WORKSPACE NOTES ENDPOINTS (ISOLATED PER WORKSPACE)
+# -------------------------------------------------------------
+class CreateWorkspaceNoteRequest(BaseModel):
+    title: str
+    content: str
+
+@app.get("/api/user/workspaces/{workspace_id}/notes")
+def get_workspace_notes(
+    workspace_id: str,
+    user: dict = Depends(get_current_user)
+):
+    """Retrieves notes belonging to a specific workspace and authenticated user."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, workspace_id, title, content, created_at, updated_at
+        FROM user_workspace_notes
+        WHERE workspace_id = ? AND user_id = ?
+        ORDER BY created_at DESC
+    """, (workspace_id, user["id"]))
+    notes = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"notes": notes}
+
+@app.post("/api/user/workspaces/{workspace_id}/notes")
+def add_workspace_note(
+    workspace_id: str,
+    req: CreateWorkspaceNoteRequest,
+    user: dict = Depends(get_current_user)
+):
+    """Creates a note in a specific workspace, isolated to the authenticated user."""
+    if not req.title.strip():
+        raise HTTPException(status_code=400, detail="Note title cannot be empty.")
+
+    note_id = f"not_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (note_id, workspace_id, user["id"], req.title.trim() if hasattr(req.title, 'trim') else req.title.strip(), req.content.strip(), now_str, now_str))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "note": {
+            "id": note_id,
+            "workspace_id": workspace_id,
+            "title": req.title.strip(),
+            "content": req.content.strip(),
+            "created_at": now_str
+        }
+    }
+

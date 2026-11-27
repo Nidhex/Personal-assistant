@@ -132,3 +132,69 @@ export async function handleApprovalActionApi(approvalId, action) {
   if (!res.ok) throw new Error('Failed to process approval action')
   return await res.json()
 }
+
+// -------------------------------------------------------------
+// CHAT & CONVERSATION API (PERSISTENT & WORKSPACE ISOLATED)
+// -------------------------------------------------------------
+export async function fetchConversations(workspaceId = null) {
+  const url = workspaceId && workspaceId !== 'main'
+    ? `/api/chat/conversations?workspace_id=${encodeURIComponent(workspaceId)}`
+    : '/api/chat/conversations'
+  const res = await fetch(url)
+  if (!res.ok) return { conversations: [] }
+  return await res.json()
+}
+
+export async function createConversation(workspaceId = null, title = 'New Conversation') {
+  const res = await fetch('/api/chat/conversations', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workspace_id: workspaceId, title })
+  })
+  if (!res.ok) throw new Error('Failed to create conversation')
+  return await res.json()
+}
+
+export async function fetchConversationMessages(conversationId) {
+  const res = await fetch(`/api/chat/conversations/${conversationId}/messages`)
+  if (!res.ok) throw new Error('Failed to load conversation messages')
+  return await res.json()
+}
+
+export async function sendChatMessage(conversationId, content, killSwitchActive = false) {
+  const res = await fetch(`/api/chat/conversations/${conversationId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content, kill_switch_active: killSwitchActive })
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to send message')
+  }
+  return await res.json()
+}
+
+export async function deleteConversation(conversationId) {
+  const res = await fetch(`/api/chat/conversations/${conversationId}`, {
+    method: 'DELETE'
+  })
+  if (!res.ok) throw new Error('Failed to delete conversation')
+  return await res.json()
+}
+
+export async function fetchWorkspaceNotes(workspaceId) {
+  const res = await fetch(`/api/user/workspaces/${workspaceId}/notes`)
+  if (!res.ok) return { notes: [] }
+  return await res.json()
+}
+
+export async function createWorkspaceNote(workspaceId, title, content) {
+  const res = await fetch(`/api/user/workspaces/${workspaceId}/notes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, content })
+  })
+  if (!res.ok) throw new Error('Failed to save note')
+  return await res.json()
+}
+
