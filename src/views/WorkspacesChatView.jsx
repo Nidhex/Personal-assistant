@@ -287,6 +287,7 @@ export default function WorkspacesChatView({
         }
         if (meta && (meta.tool_executed || meta.approval_required)) {
           window.dispatchEvent(new CustomEvent('pa:data-changed'))
+          if (onWorkspacesChanged) onWorkspacesChanged()
         }
       }
     } catch (err) {

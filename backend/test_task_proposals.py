@@ -245,10 +245,88 @@ def test_regression_chat_create_task_and_email_draft():
     print("PASS: test_regression_chat_create_task_and_email_draft")
 
 
+def test_extract_email_tasks_queues_proposals_and_dedupes():
+    init_db()
+    uid = "test_prop_user_6"
+    other_uid = "test_prop_user_6_other"
+    _setup_user(uid, "prop6@example.com")
+    _setup_user(other_uid, "prop6_other@example.com")
+    client = _client_for(uid)
+    other_client = _client_for(other_uid)
+
+    fake_messages = {
+        "messages": [
+            {
+                "id": "msg_ext_1",
+                "subject": "Assignment 3 Deadline",
+                "snippet": "Please submit Assignment 3 by tomorrow.",
+                "senderName": "Prof. Smith",
+            },
+            {
+                "id": "msg_ext_2",
+                "subject": "Weekly Newsletter",
+                "snippet": "Just some reading material.",
+                "senderName": "News",
+            },
+        ]
+    }
+
+    extract_json = json.dumps({
+        "response": "Scanning emails for deadlines",
+        "action": {"tool": "extract_email_tasks", "parameters": {"max_results": 10}},
+    })
+
+    with patch("backend.agent.fetch_gmail_messages", new=AsyncMock(return_value=fake_messages)):
+        res1 = asyncio.run(execute_policy_gate_and_tools(extract_json, uid, None, False, email_derived=False))
+        # Retry should dedupe against pending proposals
+        res2 = asyncio.run(execute_policy_gate_and_tools(extract_json, uid, None, False, email_derived=False))
+
+    assert res1["tool_executed"] == "extract_email_tasks"
+    assert res1["approval_required"] is True
+    assert res2["approval_required"] is False
+
+    conn = get_db()
+    tasks_before = conn.execute("SELECT * FROM user_tasks WHERE user_id = ?", (uid,)).fetchall()
+    approvals = conn.execute(
+        "SELECT * FROM user_approvals WHERE user_id = ? AND type = 'Task Proposal' AND status = 'pending'",
+        (uid,),
+    ).fetchall()
+    other_approvals = conn.execute(
+        "SELECT * FROM user_approvals WHERE user_id = ?",
+        (other_uid,),
+    ).fetchall()
+    conn.close()
+
+    assert len(tasks_before) == 0
+    assert len(approvals) == 1
+    assert len(other_approvals) == 0
+    payload = json.loads(approvals[0]["draft_content"])
+    assert payload["source_email_id"] == "msg_ext_1"
+    assert payload["priority"] == "high"
+    assert payload["workspace"] == "General"
+
+    appr_id = approvals[0]["id"]
+    # Other user cannot approve
+    assert other_client.post(f"/api/user/approvals/{appr_id}/action", json={"action": "approve"}).status_code == 404
+
+    # Approve once, then retry -> still 1 task
+    assert client.post(f"/api/user/approvals/{appr_id}/action", json={"action": "approve"}).status_code == 200
+    assert client.post(f"/api/user/approvals/{appr_id}/action", json={"action": "approve"}).status_code == 200
+
+    conn = get_db()
+    tasks_after = conn.execute("SELECT * FROM user_tasks WHERE user_id = ?", (uid,)).fetchall()
+    conn.close()
+    assert len(tasks_after) == 1
+    assert tasks_after[0]["source"] == "Agent Proposal"
+    assert tasks_after[0]["source_email_id"] == "msg_ext_1"
+    print("PASS: test_extract_email_tasks_queues_proposals_and_dedupes")
+
+
 if __name__ == "__main__":
     test_propose_from_email_and_approve()
     test_concurrent_and_retry_approvals()
     test_reject_and_approve_after_reject_and_user_isolation()
     test_server_side_bypass_refusal()
     test_regression_chat_create_task_and_email_draft()
+    test_extract_email_tasks_queues_proposals_and_dedupes()
     print("\nALL TASK PROPOSAL TESTS PASSED!")
