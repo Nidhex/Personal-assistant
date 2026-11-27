@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import inspect
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -14,12 +15,74 @@ class D1QueryResult:
     """
     Standard query result wrapping Cloudflare D1 query results.
     Provides fetchone(), fetchall(), rowcount, lastrowid, and dict/attribute access.
+    Supports both synchronous in-memory results and asynchronous Cloudflare D1 JS Promises.
     """
-    def __init__(self, results: List[Dict[str, Any]], meta: Optional[Dict[str, Any]] = None, success: bool = True):
-        self._results = results or []
+    def __init__(
+        self,
+        results: Optional[List[Dict[str, Any]]] = None,
+        meta: Optional[Dict[str, Any]] = None,
+        success: bool = True,
+        promise: Optional[Any] = None
+    ):
+        self._results = results if results is not None else []
         self._meta = meta or {}
         self.success = success
+        self._promise = promise
         self._cursor_idx = 0
+
+    async def _resolve(self):
+        if self._promise is not None:
+            raw_res = await self._promise
+            if hasattr(raw_res, "to_py"):
+                try:
+                    res_dict = raw_res.to_py()
+                except Exception:
+                    res_dict = raw_res
+            elif isinstance(raw_res, dict):
+                res_dict = raw_res
+            else:
+                res_dict = raw_res
+
+            if isinstance(res_dict, dict):
+                raw_results = res_dict.get("results", [])
+                meta = res_dict.get("meta", {})
+                success = res_dict.get("success", True)
+            else:
+                raw_results = getattr(res_dict, "results", [])
+                meta = getattr(res_dict, "meta", {})
+                success = getattr(res_dict, "success", True)
+
+            parsed = []
+            if raw_results is not None:
+                for r in raw_results:
+                    if hasattr(r, "to_py"):
+                        try:
+                            parsed.append(r.to_py())
+                            continue
+                        except Exception:
+                            pass
+                    if isinstance(r, dict):
+                        parsed.append(r)
+                    else:
+                        try:
+                            parsed.append(dict(r))
+                        except Exception:
+                            parsed.append(r)
+
+            self._results = parsed
+            if hasattr(meta, "to_py"):
+                try:
+                    self._meta = meta.to_py()
+                except Exception:
+                    self._meta = meta or {}
+            else:
+                self._meta = meta if isinstance(meta, dict) else {}
+            self.success = bool(success)
+            self._promise = None
+        return self
+
+    def __await__(self):
+        return self._resolve().__await__()
 
     @property
     def rowcount(self) -> int:
@@ -63,16 +126,26 @@ class D1PreparedStatement:
         self.params = list(params)
         return self
 
-    def all(self) -> Dict[str, Any]:
-        res = self.adapter.execute(self.sql, self.params)
+    async def _all_async(self) -> Dict[str, Any]:
+        res = await self.adapter.execute(self.sql, self.params)
         return {
             "results": res.fetchall(),
             "success": res.success,
             "meta": res._meta
         }
 
-    def first(self, col_name: Optional[str] = None) -> Any:
+    def all(self) -> Any:
         res = self.adapter.execute(self.sql, self.params)
+        if getattr(res, "_promise", None) is not None:
+            return self._all_async()
+        return {
+            "results": res.fetchall(),
+            "success": res.success,
+            "meta": res._meta
+        }
+
+    async def _first_async(self, col_name: Optional[str] = None) -> Any:
+        res = await self.adapter.execute(self.sql, self.params)
         row = res.fetchone()
         if not row:
             return None
@@ -80,22 +153,50 @@ class D1PreparedStatement:
             return row.get(col_name)
         return row
 
-    def run(self) -> Dict[str, Any]:
+    def first(self, col_name: Optional[str] = None) -> Any:
         res = self.adapter.execute(self.sql, self.params)
+        if getattr(res, "_promise", None) is not None:
+            return self._first_async(col_name)
+        row = res.fetchone()
+        if not row:
+            return None
+        if col_name:
+            return row.get(col_name)
+        return row
+
+    async def _run_async(self) -> Dict[str, Any]:
+        res = await self.adapter.execute(self.sql, self.params)
         return {
             "success": res.success,
             "meta": res._meta
         }
 
-    def raw(self) -> List[List[Any]]:
+    def run(self) -> Any:
         res = self.adapter.execute(self.sql, self.params)
+        if getattr(res, "_promise", None) is not None:
+            return self._run_async()
+        return {
+            "success": res.success,
+            "meta": res._meta
+        }
+
+    async def _raw_async(self) -> List[List[Any]]:
+        res = await self.adapter.execute(self.sql, self.params)
+        rows = res.fetchall()
+        return [list(r.values()) for r in rows]
+
+    def raw(self) -> Any:
+        res = self.adapter.execute(self.sql, self.params)
+        if getattr(res, "_promise", None) is not None:
+            return self._raw_async()
         rows = res.fetchall()
         return [list(r.values()) for r in rows]
 
 
 class D1Cursor:
     """
-    Cursor interface adapter allowing existing database queries to execute seamlessly.
+    Cursor interface adapter allowing database queries to execute seamlessly.
+    Supports both synchronous execution and async await cursor.execute(...).
     """
     def __init__(self, adapter: "CloudflareD1DatabaseAdapter"):
         self.adapter = adapter
@@ -110,6 +211,14 @@ class D1Cursor:
             self.execute(sql, p)
         return self
 
+    async def _resolve(self):
+        if self._last_result is not None:
+            await self._last_result
+        return self
+
+    def __await__(self):
+        return self._resolve().__await__()
+
     def fetchone(self) -> Optional[Dict[str, Any]]:
         if self._last_result:
             return self._last_result.fetchone()
@@ -119,6 +228,9 @@ class D1Cursor:
         if self._last_result:
             return self._last_result.fetchall()
         return []
+
+    def close(self):
+        pass
 
     @property
     def rowcount(self) -> int:
@@ -190,14 +302,13 @@ class CloudflareD1DatabaseAdapter:
             if p:
                 stmt = stmt.bind(*p)
             res = stmt.all()
+            if inspect.isawaitable(res) or hasattr(res, "__await__"):
+                return D1QueryResult(promise=res)
+            # Sync result (e.g. mock or test dict)
             results = res.get("results", []) if isinstance(res, dict) else getattr(res, "results", [])
             meta = res.get("meta", {}) if isinstance(res, dict) else getattr(res, "meta", {})
             success = res.get("success", True) if isinstance(res, dict) else getattr(res, "success", True)
-            return D1QueryResult(
-                results=results,
-                meta=meta,
-                success=success
-            )
+            return D1QueryResult(results=results, meta=meta, success=success)
 
         # 3. Cloudflare D1 HTTP REST API Mode
         if not (self.account_id and self.database_id and self.api_token):
@@ -256,6 +367,12 @@ class CloudflareD1DatabaseAdapter:
         if self._test_conn:
             self._test_conn.close()
 
+    async def _resolve(self):
+        return self
+
+    def __await__(self):
+        return self._resolve().__await__()
+
     def __enter__(self):
         return self
 
@@ -265,6 +382,41 @@ class CloudflareD1DatabaseAdapter:
         else:
             self.commit()
         return False
+
+
+class SQLiteCursorWrapper(sqlite3.Cursor):
+    """
+    Subclass of sqlite3.Cursor that provides async __await__ support
+    while preserving 100% of synchronous cursor methods and properties.
+    """
+    def __await__(self):
+        async def _noop():
+            return self
+        return _noop().__await__()
+
+
+class SQLiteConnectionWrapper(sqlite3.Connection):
+    """
+    Subclass of sqlite3.Connection that returns SQLiteCursorWrapper
+    and supports async __await__ for execute() and commits.
+    """
+    def cursor(self, *args, **kwargs) -> SQLiteCursorWrapper:
+        return super().cursor(SQLiteCursorWrapper)
+
+    def execute(self, *args, **kwargs) -> SQLiteCursorWrapper:
+        cur = self.cursor()
+        cur.execute(*args, **kwargs)
+        return cur
+
+    def executemany(self, *args, **kwargs) -> SQLiteCursorWrapper:
+        cur = self.cursor()
+        cur.executemany(*args, **kwargs)
+        return cur
+
+    def __await__(self):
+        async def _noop():
+            return self
+        return _noop().__await__()
 
 
 def get_db(adapter: Optional[str] = None, **kwargs):
@@ -291,7 +443,7 @@ def get_db(adapter: Optional[str] = None, **kwargs):
 
     if chosen == "sqlite":
         db_file = kwargs_copy.get("db_path", DB_PATH)
-        conn = sqlite3.connect(db_file, timeout=30.0)
+        conn = sqlite3.connect(db_file, timeout=30.0, factory=SQLiteConnectionWrapper)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.row_factory = sqlite3.Row

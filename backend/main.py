@@ -99,7 +99,7 @@ COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true" or IS_PROD
 # -------------------------------------------------------------
 # AUTHENTICATION DEPENDENCY
 # -------------------------------------------------------------
-def get_current_user_optional(request: Request) -> Optional[dict]:
+async def get_current_user_optional(request: Request) -> Optional[dict]:
     session_id = request.cookies.get("session_id")
     if not session_id:
         # Fallback to Authorization header if provided
@@ -112,7 +112,7 @@ def get_current_user_optional(request: Request) -> Optional[dict]:
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
+    await cursor.execute("""
         SELECT s.session_id, s.expires_at, u.id, u.email, u.name, u.picture
         FROM sessions s
         JOIN users u ON s.user_id = u.id
@@ -125,13 +125,13 @@ def get_current_user_optional(request: Request) -> Optional[dict]:
         return None
 
     if is_expired(row["expires_at"]):
-        cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        await cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.commit()
         conn.close()
         return None
 
     # Check gmail connection status
-    cursor.execute("""
+    await cursor.execute("""
         SELECT gmail_connected, scopes FROM user_tokens WHERE user_id = ?
     """, (row["id"],))
     token_row = cursor.fetchone()
@@ -149,8 +149,8 @@ def get_current_user_optional(request: Request) -> Optional[dict]:
         "scopes": scopes
     }
 
-def get_current_user(request: Request) -> dict:
-    user = get_current_user_optional(request)
+async def get_current_user(request: Request) -> dict:
+    user = await get_current_user_optional(request)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -360,8 +360,8 @@ def get_terms_page():
 # AUTH & OAUTH ROUTES
 # -------------------------------------------------------------
 @app.get("/api/auth/status")
-def auth_status(request: Request):
-    """Returns Google OAuth configuration readiness and dev mode flag."""
+async def auth_status(request: Request):
+    """Returns Google OAuth configuration readiness, auth state, and dev mode flag."""
     from .google_service import get_config_val, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
     cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
     csec = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
@@ -371,17 +371,20 @@ def auth_status(request: Request):
         missing.append("GOOGLE_CLIENT_ID")
     if not csec:
         missing.append("GOOGLE_CLIENT_SECRET")
+    user = await get_current_user_optional(request)
     return {
         "google_configured": configured,
         "dev_test_mode_enabled": is_dev_test_mode(request),
         "missing_keys": missing,
-        "scopes_requested": GOOGLE_SCOPES
+        "scopes_requested": GOOGLE_SCOPES,
+        "authenticated": user is not None,
+        "user": user
     }
 
 @app.get("/api/auth/me")
-def get_me(request: Request):
+async def get_me(request: Request):
     """Returns current active authenticated user or unauthenticated status."""
-    user = get_current_user_optional(request)
+    user = await get_current_user_optional(request)
     if not user:
         return {"authenticated": False, "user": None, "gmail_connected": False}
     return {
@@ -397,7 +400,7 @@ def get_me(request: Request):
     }
 
 @app.get("/api/auth/google/url")
-def get_auth_url(request: Request, user: Optional[dict] = Depends(get_current_user_optional)):
+async def get_auth_url(request: Request, user: Optional[dict] = Depends(get_current_user_optional)):
     """Generates secure state and returns official Google OAuth URL."""
     if not is_google_configured():
         raise HTTPException(
@@ -406,10 +409,10 @@ def get_auth_url(request: Request, user: Optional[dict] = Depends(get_current_us
         )
 
     state = generate_oauth_state()
-    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
 
     conn = get_db()
-    conn.execute("""
+    await conn.execute("""
         INSERT INTO oauth_states (state, action, user_id, expires_at)
         VALUES (?, ?, ?, ?)
     """, (state, "login", user["id"] if user else None, expires_at))
@@ -428,9 +431,10 @@ async def google_callback(
 ):
     """Handles Google redirect, exchanges code, verifies state, sets session cookie."""
     frontend_base = get_frontend_url(request)
+    from urllib.parse import quote_plus
 
     if error:
-        return RedirectResponse(f"{frontend_base}/?auth_error={error}")
+        return RedirectResponse(f"{frontend_base}/?auth_error={quote_plus(str(error))}")
 
     if not code or not state:
         return RedirectResponse(f"{frontend_base}/?auth_error=missing_parameters")
@@ -438,7 +442,7 @@ async def google_callback(
     # Validate state CSRF
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT state, action, user_id, expires_at FROM oauth_states WHERE state = ?", (state,))
+    await cursor.execute("SELECT state, action, user_id, expires_at FROM oauth_states WHERE state = ?", (state,))
     row = cursor.fetchone()
 
     if not row or is_expired(row["expires_at"]):
@@ -446,7 +450,7 @@ async def google_callback(
         return RedirectResponse(f"{frontend_base}/?auth_error=invalid_or_expired_state")
 
     # Remove used state
-    cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+    await cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
     conn.commit()
 
     try:
@@ -468,7 +472,7 @@ async def google_callback(
         user_id = f"usr_{google_id}"
 
         # Upsert user
-        cursor.execute("""
+        await cursor.execute("""
             INSERT INTO users (id, email, name, picture, created_at)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
@@ -479,7 +483,7 @@ async def google_callback(
 
         # Check if we already have a refresh token stored if Google didn't return one this time
         if not refresh_token:
-            cursor.execute("SELECT refresh_token_encrypted FROM user_tokens WHERE user_id = ?", (user_id,))
+            await cursor.execute("SELECT refresh_token_encrypted FROM user_tokens WHERE user_id = ?", (user_id,))
             existing = cursor.fetchone()
             if existing and existing["refresh_token_encrypted"]:
                 # Keep existing encrypted refresh token
@@ -490,7 +494,7 @@ async def google_callback(
             encrypted_refresh = encrypt_token(refresh_token)
 
         # Upsert user tokens
-        cursor.execute("""
+        await cursor.execute("""
             INSERT INTO user_tokens (
                 user_id, access_token_encrypted, refresh_token_encrypted, 
                 token_expiry, scopes, gmail_connected, updated_at
@@ -515,7 +519,7 @@ async def google_callback(
         # Create session
         session_id = generate_session_id()
         expires_at = get_session_expiry(days=7)
-        cursor.execute("""
+        await cursor.execute("""
             INSERT INTO sessions (session_id, user_id, expires_at, created_at)
             VALUES (?, ?, ?, ?)
         """, (session_id, user_id, expires_at, datetime.now(timezone.utc).isoformat()))
@@ -546,10 +550,11 @@ async def google_callback(
 
     except Exception as e:
         conn.close()
-        return RedirectResponse(f"{frontend_base}/?auth_error={str(e)}")
+        from urllib.parse import quote_plus
+        return RedirectResponse(f"{frontend_base}/?auth_error={quote_plus(str(e))}")
 
 @app.post("/api/auth/logout")
-def logout(request: Request, response: Response):
+async def logout(request: Request, response: Response):
     """Destroys current session and deletes session cookie."""
     session_id = request.cookies.get("session_id")
     if not session_id:
@@ -559,7 +564,7 @@ def logout(request: Request, response: Response):
 
     if session_id:
         conn = get_db()
-        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        await conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.commit()
         conn.close()
 
@@ -576,7 +581,7 @@ class DevLoginRequest(BaseModel):
     name: Optional[str] = "Test Developer"
 
 @app.post("/api/auth/dev-login")
-def dev_login(req: DevLoginRequest, request: Request, response: Response):
+async def dev_login(req: DevLoginRequest, request: Request, response: Response):
     """Only enabled when DEV_TEST_MODE=true in .env for local offline testing."""
     if not is_dev_test_mode(request):
         raise HTTPException(
@@ -586,19 +591,30 @@ def dev_login(req: DevLoginRequest, request: Request, response: Response):
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
+    await cursor.execute("""
         INSERT INTO users (id, email, name, picture, created_at)
         VALUES (?, ?, ?, '', ?)
         ON CONFLICT(id) DO UPDATE SET email = excluded.email, name = excluded.name
     """, (req.user_id, req.email, req.name, datetime.now(timezone.utc).isoformat()))
 
     session_id = generate_session_id()
-    cursor.execute("""
+    await cursor.execute("""
         INSERT INTO sessions (session_id, user_id, expires_at, created_at)
         VALUES (?, ?, ?, ?)
     """, (session_id, req.user_id, get_session_expiry(7), datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
+
+    res = JSONResponse({"success": True, "user_id": req.user_id, "email": req.email})
+    res.set_cookie(
+        key="session_id",
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        secure=is_cookie_secure(request),
+        max_age=7 * 24 * 3600
+    )
+    return res
 
     res = JSONResponse({"success": True, "user_id": req.user_id, "email": req.email})
     res.set_cookie(

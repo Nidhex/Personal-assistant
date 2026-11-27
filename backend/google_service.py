@@ -178,7 +178,7 @@ async def get_valid_access_token(user_id: str) -> str:
     """Retrieves access token for user, refreshing automatically if expired."""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
+    await cursor.execute("""
         SELECT access_token_encrypted, refresh_token_encrypted, token_expiry, gmail_connected
         FROM user_tokens WHERE user_id = ?
     """, (user_id,))
@@ -211,7 +211,7 @@ async def get_valid_access_token(user_id: str) -> str:
     if not refresh_token:
         # Cannot refresh without refresh_token; mark as disconnected
         conn = get_db()
-        conn.execute("UPDATE user_tokens SET gmail_connected = 0 WHERE user_id = ?", (user_id,))
+        await conn.execute("UPDATE user_tokens SET gmail_connected = 0 WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
         raise Exception("Google authorization expired and no refresh token is present. Please reconnect.")
@@ -234,7 +234,7 @@ async def get_valid_access_token(user_id: str) -> str:
         if res.status_code != 200:
             # Refresh token was revoked by user or expired
             conn = get_db()
-            conn.execute("UPDATE user_tokens SET gmail_connected = 0 WHERE user_id = ?", (user_id,))
+            await conn.execute("UPDATE user_tokens SET gmail_connected = 0 WHERE user_id = ?", (user_id,))
             conn.commit()
             conn.close()
             raise Exception(f"Google token refresh failed: {res.text}. Access was likely revoked.")
@@ -245,7 +245,7 @@ async def get_valid_access_token(user_id: str) -> str:
         new_expiry = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
 
         conn = get_db()
-        conn.execute("""
+        await conn.execute("""
             UPDATE user_tokens 
             SET access_token_encrypted = ?, token_expiry = ?, updated_at = ?
             WHERE user_id = ?
@@ -259,7 +259,7 @@ async def revoke_user_tokens(user_id: str):
     """Revokes access with Google and removes local credentials."""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
+    await cursor.execute("""
         SELECT access_token_encrypted, refresh_token_encrypted
         FROM user_tokens WHERE user_id = ?
     """, (user_id,))
@@ -278,7 +278,7 @@ async def revoke_user_tokens(user_id: str):
             except Exception:
                 pass  # Revoke silently if already invalid
 
-        cursor.execute("""
+        await cursor.execute("""
             UPDATE user_tokens 
             SET access_token_encrypted = '', refresh_token_encrypted = '', gmail_connected = 0, updated_at = ?
             WHERE user_id = ?

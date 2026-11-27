@@ -71,7 +71,10 @@ def is_expired(iso_timestamp: str) -> bool:
     if not iso_timestamp:
         return True
     try:
-        dt = datetime.fromisoformat(iso_timestamp)
+        ts = str(iso_timestamp).strip()
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) > dt
