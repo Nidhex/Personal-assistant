@@ -16,15 +16,19 @@ except ImportError:
     HAS_WORKERS = False
 
 if HAS_WORKERS:
+    from workers.asgi import fetch as asgi_fetch
+    from backend.main import app
+
     class Default(WorkerEntrypoint):
         async def fetch(self, request):
-            from backend.worker import get_asgi_handler
-            handler = get_asgi_handler()
-            return await handler(request, self.env, self.ctx)
+            return await asgi_fetch(app, request, self.env, self.ctx)
 
-        async def scheduled(self, controller):
+        async def scheduled(self, *args, **kwargs):
             from backend.worker import handle_worker_scheduled_tick
-            return await handle_worker_scheduled_tick(self.env)
+            env = getattr(self, "env", None)
+            if not env and len(args) > 1:
+                env = args[1]
+            return await handle_worker_scheduled_tick(env)
 else:
     from backend.worker import default
     Default = default

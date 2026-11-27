@@ -24,6 +24,6 @@
     "COOKIE_SECURE": "true",
     "DEV_TEST_MODE": "false",
     "FRONTEND_URL": "https://deskagent.pages.dev",
-    "GOOGLE_REDIRECT_URI": "https://deskagent-backend.<your-subdomain>.workers.dev/api/auth/google/callback"
+    "GOOGLE_REDIRECT_URI": "https://deskagent-backend.hacckthon.workers.dev/api/auth/google/callback"
   }
 }

@@ -274,7 +274,8 @@ def get_db(adapter: Optional[str] = None, **kwargs):
     When running inside a Cloudflare Python Worker, automatically binds to worker_env.DB.
     """
     # 1. Check if worker_env was passed explicitly or via request ContextVar
-    worker_env = kwargs.get("worker_env")
+    kwargs_copy = dict(kwargs)
+    worker_env = kwargs_copy.pop("worker_env", None)
     if worker_env is None:
         try:
             from .main import current_worker_env
@@ -284,19 +285,19 @@ def get_db(adapter: Optional[str] = None, **kwargs):
 
     # 2. If running inside Cloudflare Worker with D1 binding and no explicit adapter override
     if worker_env and hasattr(worker_env, "DB") and adapter is None:
-        return CloudflareD1DatabaseAdapter(worker_env=worker_env, **kwargs)
+        return CloudflareD1DatabaseAdapter(worker_env=worker_env, **kwargs_copy)
 
     chosen = (adapter or os.getenv("DB_ADAPTER", "sqlite")).lower()
 
     if chosen == "sqlite":
-        db_file = kwargs.get("db_path", DB_PATH)
+        db_file = kwargs_copy.get("db_path", DB_PATH)
         conn = sqlite3.connect(db_file, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.row_factory = sqlite3.Row
         return conn
     elif chosen == "d1":
-        return CloudflareD1DatabaseAdapter(worker_env=worker_env, **kwargs)
+        return CloudflareD1DatabaseAdapter(worker_env=worker_env, **kwargs_copy)
     else:
         raise ValueError(f"Unsupported DB_ADAPTER '{chosen}'. Supported: 'sqlite', 'd1'.")
 

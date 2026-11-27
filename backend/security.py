@@ -1,5 +1,6 @@
 import os
 import secrets
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -28,12 +29,21 @@ def get_encryption_key() -> str:
         return key
     return DEV_FALLBACK_KEY
 
-def get_fernet() -> Fernet:
-    key_str = get_encryption_key()
-    return Fernet(key_str.encode() if isinstance(key_str, str) else key_str)
+_fernet_instance: Optional[Fernet] = None
 
-# Retain module-level fernet for backwards compatibility with existing imports
-fernet = get_fernet()
+def get_fernet() -> Fernet:
+    global _fernet_instance
+    if _fernet_instance is None:
+        key_str = get_encryption_key()
+        _fernet_instance = Fernet(key_str.encode() if isinstance(key_str, str) else key_str)
+    return _fernet_instance
+
+# Lazy accessor for backwards compatibility with existing imports
+class _LazyFernet:
+    def __getattr__(self, name):
+        return getattr(get_fernet(), name)
+
+fernet = _LazyFernet()
 
 def encrypt_token(token: str) -> str:
     if not token:

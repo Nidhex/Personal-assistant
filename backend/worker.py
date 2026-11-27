@@ -70,9 +70,12 @@ if HAS_WORKERS_RUNTIME:
             handler = get_asgi_handler()
             return await handler(request, self.env, self.ctx)
 
-        async def scheduled(self, controller):
+        async def scheduled(self, *args, **kwargs):
             """Handles Cloudflare Cron Triggers."""
-            return await handle_worker_scheduled_tick(self.env)
+            env = getattr(self, "env", None)
+            if not env and len(args) > 1:
+                env = args[1]
+            return await handle_worker_scheduled_tick(env)
 else:
     class LocalASGIProxy:
         async def __call__(self, scope, receive, send):

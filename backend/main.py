@@ -38,12 +38,12 @@ load_dotenv()
 # Global ContextVar storing Cloudflare Worker environment bindings per request
 current_worker_env: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("current_worker_env", default=None)
 
-# Initialize DB on startup (SQLite in local dev, D1 initialized via migration in production)
-try:
-    init_db()
-except Exception:
-    # Allows import in environments where local SQLite filesystem is read-only
-    pass
+# Initialize DB on startup (SQLite in local dev; D1 initialized via migrations in production)
+if os.getenv("WORKER_ENV") != "1" and os.getenv("ENVIRONMENT") != "production" and os.getenv("CF_PAGES") != "1":
+    try:
+        init_db()
+    except Exception:
+        pass
 
 app = FastAPI(title="Personal Assistant API", version="1.0.0")
 
@@ -61,7 +61,12 @@ async def cloudflare_worker_env_middleware(request: Request, call_next):
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://deskagent.pages.dev",
+    ],
+    allow_origin_regex=r"^https://.*\.pages\.dev$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -153,16 +158,19 @@ def get_current_user(request: Request) -> dict:
 @app.get("/api/auth/status")
 def auth_status():
     """Returns Google OAuth configuration readiness and dev mode flag."""
+    from .google_service import get_config_val, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+    cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
+    csec = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
     configured = is_google_configured()
+    missing = []
+    if not cid:
+        missing.append("GOOGLE_CLIENT_ID")
+    if not csec:
+        missing.append("GOOGLE_CLIENT_SECRET")
     return {
         "google_configured": configured,
         "dev_test_mode_enabled": DEV_TEST_MODE,
-        "missing_keys": [
-            k for k, v in [
-                ("GOOGLE_CLIENT_ID", os.getenv("GOOGLE_CLIENT_ID")),
-                ("GOOGLE_CLIENT_SECRET", os.getenv("GOOGLE_CLIENT_SECRET"))
-            ] if not v
-        ],
+        "missing_keys": missing,
         "scopes_requested": GOOGLE_SCOPES
     }
 
@@ -314,8 +322,8 @@ async def google_callback(
             key="session_id",
             value=session_id,
             httponly=True,
-            samesite="lax",
-            secure=COOKIE_SECURE,
+            samesite="none" if IS_PRODUCTION else "lax",
+            secure=True if IS_PRODUCTION else COOKIE_SECURE,
             max_age=7 * 24 * 3600
         )
         return response

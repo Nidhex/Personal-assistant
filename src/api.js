@@ -1,8 +1,20 @@
 // Frontend API client for backend authentication and Gmail operations
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? 'https://deskagent-backend.hacckthon.workers.dev' : '')
+
+async function apiFetch(url, options = {}) {
+  const fullUrl = url.startsWith('/') ? `${API_BASE}${url}` : url
+  const opts = {
+    credentials: 'include',
+    ...options
+  }
+  return fetch(fullUrl, opts)
+}
+
+
 export async function checkAuthStatus() {
   try {
-    const res = await fetch('/api/auth/status')
+    const res = await apiFetch('/api/auth/status')
     if (!res.ok) throw new Error('Failed to fetch auth status')
     return await res.json()
   } catch (err) {
@@ -17,7 +29,7 @@ export async function checkAuthStatus() {
 
 export async function fetchCurrentUser() {
   try {
-    const res = await fetch('/api/auth/me')
+    const res = await apiFetch('/api/auth/me')
     if (!res.ok) return { authenticated: false, user: null, gmail_connected: false }
     return await res.json()
   } catch (err) {
@@ -26,7 +38,7 @@ export async function fetchCurrentUser() {
 }
 
 export async function getGoogleAuthUrl() {
-  const res = await fetch('/api/auth/google/url')
+  const res = await apiFetch('/api/auth/google/url')
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || 'Failed to generate Google authentication URL')
@@ -36,7 +48,7 @@ export async function getGoogleAuthUrl() {
 
 export async function logoutUser() {
   try {
-    const res = await fetch('/api/auth/logout', { method: 'POST' })
+    const res = await apiFetch('/api/auth/logout', { method: 'POST' })
     return await res.json()
   } catch (err) {
     return { success: false, error: err.message }
@@ -44,7 +56,7 @@ export async function logoutUser() {
 }
 
 export async function devLogin(email = 'developer@test.local', name = 'Test User') {
-  const res = await fetch('/api/auth/dev-login', {
+  const res = await apiFetch('/api/auth/dev-login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, name })
@@ -61,7 +73,7 @@ export async function fetchGmailMessages(pageToken = null, maxResults = 15) {
   params.set('max_results', maxResults.toString())
   if (pageToken) params.set('page_token', pageToken)
 
-  const res = await fetch(`/api/gmail/messages?${params.toString()}`)
+  const res = await apiFetch(`/api/gmail/messages?${params.toString()}`)
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || 'Failed to fetch messages from Gmail')
@@ -70,7 +82,7 @@ export async function fetchGmailMessages(pageToken = null, maxResults = 15) {
 }
 
 export async function fetchGmailMessageDetail(messageId) {
-  const res = await fetch(`/api/gmail/messages/${messageId}`)
+  const res = await apiFetch(`/api/gmail/messages/${messageId}`)
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || 'Failed to fetch email message details')
@@ -79,7 +91,7 @@ export async function fetchGmailMessageDetail(messageId) {
 }
 
 export async function disconnectGmail() {
-  const res = await fetch('/api/gmail/disconnect', { method: 'POST' })
+  const res = await apiFetch('/api/gmail/disconnect', { method: 'POST' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || 'Failed to disconnect Gmail')
@@ -89,7 +101,7 @@ export async function disconnectGmail() {
 
 export async function fetchUserData() {
   try {
-    const res = await fetch('/api/user/data')
+    const res = await apiFetch('/api/user/data')
     if (!res.ok) return { tasks: [], workspaces: [], approvals: [], activity: [] }
     return await res.json()
   } catch {
@@ -98,7 +110,7 @@ export async function fetchUserData() {
 }
 
 export async function createUserTask(task) {
-  const res = await fetch('/api/user/tasks', {
+  const res = await apiFetch('/api/user/tasks', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(task)
@@ -108,7 +120,7 @@ export async function createUserTask(task) {
 }
 
 export async function proposeTaskFromEmail(messageId) {
-  const res = await fetch(`/api/gmail/messages/${encodeURIComponent(messageId)}/propose-task`, {
+  const res = await apiFetch(`/api/gmail/messages/${encodeURIComponent(messageId)}/propose-task`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' }
   })
@@ -120,13 +132,13 @@ export async function proposeTaskFromEmail(messageId) {
 }
 
 export async function toggleUserTask(taskId) {
-  const res = await fetch(`/api/user/tasks/${taskId}/toggle`, { method: 'POST' })
+  const res = await apiFetch(`/api/user/tasks/${taskId}/toggle`, { method: 'POST' })
   if (!res.ok) throw new Error('Failed to update task')
   return await res.json()
 }
 
 export async function updateUserTask(taskId, updates) {
-  const res = await fetch(`/api/user/tasks/${encodeURIComponent(taskId)}`, {
+  const res = await apiFetch(`/api/user/tasks/${encodeURIComponent(taskId)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates)
@@ -139,7 +151,7 @@ export async function updateUserTask(taskId, updates) {
 }
 
 export async function deleteUserTask(taskId) {
-  const res = await fetch(`/api/user/tasks/${encodeURIComponent(taskId)}`, {
+  const res = await apiFetch(`/api/user/tasks/${encodeURIComponent(taskId)}`, {
     method: 'DELETE'
   })
   if (!res.ok) {
@@ -150,7 +162,7 @@ export async function deleteUserTask(taskId) {
 }
 
 export async function fetchYouTubeNotes(url) {
-  const res = await fetch('/api/youtube/notes', {
+  const res = await apiFetch('/api/youtube/notes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url })
@@ -166,7 +178,7 @@ export async function fetchYouTubeNotes(url) {
 }
 
 export async function createUserWorkspace(ws) {
-  const res = await fetch('/api/user/workspaces', {
+  const res = await apiFetch('/api/user/workspaces', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(ws)
@@ -176,7 +188,7 @@ export async function createUserWorkspace(ws) {
 }
 
 export async function handleApprovalActionApi(approvalId, action) {
-  const res = await fetch(`/api/user/approvals/${approvalId}/action`, {
+  const res = await apiFetch(`/api/user/approvals/${approvalId}/action`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action })
@@ -192,13 +204,13 @@ export async function fetchConversations(workspaceId = null) {
   const url = workspaceId && workspaceId !== 'main'
     ? `/api/chat/conversations?workspace_id=${encodeURIComponent(workspaceId)}`
     : '/api/chat/conversations'
-  const res = await fetch(url)
+  const res = await apiFetch(url)
   if (!res.ok) return { conversations: [] }
   return await res.json()
 }
 
 export async function createConversation(workspaceId = null, title = 'New Conversation') {
-  const res = await fetch('/api/chat/conversations', {
+  const res = await apiFetch('/api/chat/conversations', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ workspace_id: workspaceId, title })
@@ -208,13 +220,13 @@ export async function createConversation(workspaceId = null, title = 'New Conver
 }
 
 export async function fetchConversationMessages(conversationId) {
-  const res = await fetch(`/api/chat/conversations/${conversationId}/messages`)
+  const res = await apiFetch(`/api/chat/conversations/${conversationId}/messages`)
   if (!res.ok) throw new Error('Failed to load conversation messages')
   return await res.json()
 }
 
 export async function sendChatMessage(conversationId, content, killSwitchActive = false) {
-  const res = await fetch(`/api/chat/conversations/${conversationId}/messages`, {
+  const res = await apiFetch(`/api/chat/conversations/${conversationId}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content, kill_switch_active: killSwitchActive })
@@ -227,7 +239,7 @@ export async function sendChatMessage(conversationId, content, killSwitchActive 
 }
 
 export async function deleteConversation(conversationId) {
-  const res = await fetch(`/api/chat/conversations/${conversationId}`, {
+  const res = await apiFetch(`/api/chat/conversations/${conversationId}`, {
     method: 'DELETE'
   })
   if (!res.ok) throw new Error('Failed to delete conversation')
@@ -235,13 +247,13 @@ export async function deleteConversation(conversationId) {
 }
 
 export async function fetchWorkspaceNotes(workspaceId) {
-  const res = await fetch(`/api/user/workspaces/${workspaceId}/notes`)
+  const res = await apiFetch(`/api/user/workspaces/${workspaceId}/notes`)
   if (!res.ok) return { notes: [] }
   return await res.json()
 }
 
 export async function createWorkspaceNote(workspaceId, title, content) {
-  const res = await fetch(`/api/user/workspaces/${workspaceId}/notes`, {
+  const res = await apiFetch(`/api/user/workspaces/${workspaceId}/notes`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, content })
@@ -255,13 +267,13 @@ export async function createWorkspaceNote(workspaceId, title, content) {
 // -------------------------------------------------------------
 export async function fetchCalendarEvents(date = null) {
   const url = date ? `/api/user/calendar/events?date=${encodeURIComponent(date)}` : '/api/user/calendar/events'
-  const res = await fetch(url)
+  const res = await apiFetch(url)
   if (!res.ok) return { events: [] }
   return await res.json()
 }
 
 export async function createCalendarEvent(eventData) {
-  const res = await fetch('/api/user/calendar/events', {
+  const res = await apiFetch('/api/user/calendar/events', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(eventData)
@@ -274,7 +286,7 @@ export async function createCalendarEvent(eventData) {
 }
 
 export async function updateCalendarEvent(eventId, eventData) {
-  const res = await fetch(`/api/user/calendar/events/${eventId}`, {
+  const res = await apiFetch(`/api/user/calendar/events/${eventId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(eventData)
@@ -287,7 +299,7 @@ export async function updateCalendarEvent(eventId, eventData) {
 }
 
 export async function deleteCalendarEvent(eventId) {
-  const res = await fetch(`/api/user/calendar/events/${eventId}`, {
+  const res = await apiFetch(`/api/user/calendar/events/${eventId}`, {
     method: 'DELETE'
   })
   if (!res.ok) throw new Error('Failed to delete calendar event')
@@ -298,13 +310,13 @@ export async function deleteCalendarEvent(eventId) {
 // STUDY MATERIALS & REVISION PLAN API
 // -------------------------------------------------------------
 export async function fetchWorkspaceStudyMaterials(workspaceId) {
-  const res = await fetch(`/api/user/workspaces/${workspaceId}/study-materials`)
+  const res = await apiFetch(`/api/user/workspaces/${workspaceId}/study-materials`)
   if (!res.ok) return { materials: [] }
   return await res.json()
 }
 
 export async function uploadStudyMaterial(workspaceId, filename, contentText) {
-  const res = await fetch(`/api/user/workspaces/${workspaceId}/study-materials`, {
+  const res = await apiFetch(`/api/user/workspaces/${workspaceId}/study-materials`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ filename, content_text: contentText })
@@ -314,7 +326,7 @@ export async function uploadStudyMaterial(workspaceId, filename, contentText) {
 }
 
 export async function fetchWorkspaceRevisionPlan(workspaceId) {
-  const res = await fetch(`/api/user/workspaces/${workspaceId}/revision-plan`)
+  const res = await apiFetch(`/api/user/workspaces/${workspaceId}/revision-plan`)
   if (!res.ok) return { plan: null }
   return await res.json()
 }
@@ -323,13 +335,13 @@ export async function fetchWorkspaceRevisionPlan(workspaceId) {
 // DAILY RUNS, DIGESTS & SCHEDULER API
 // -------------------------------------------------------------
 export async function fetchAgentSettings() {
-  const res = await fetch('/api/agent/settings')
+  const res = await apiFetch('/api/agent/settings')
   if (!res.ok) return { settings: null }
   return await res.json()
 }
 
 export async function updateAgentSettings(settings) {
-  const res = await fetch('/api/agent/settings', {
+  const res = await apiFetch('/api/agent/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(settings)
@@ -339,7 +351,7 @@ export async function updateAgentSettings(settings) {
 }
 
 export async function setKillSwitchApi(enabled) {
-  const res = await fetch('/api/agent/kill-switch', {
+  const res = await apiFetch('/api/agent/kill-switch', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled })
@@ -349,7 +361,7 @@ export async function setKillSwitchApi(enabled) {
 }
 
 export async function triggerManualAgentRun() {
-  const res = await fetch('/api/agent/runs/trigger', {
+  const res = await apiFetch('/api/agent/runs/trigger', {
     method: 'POST'
   })
   if (!res.ok) {
@@ -360,25 +372,25 @@ export async function triggerManualAgentRun() {
 }
 
 export async function fetchAgentRuns() {
-  const res = await fetch('/api/agent/runs')
+  const res = await apiFetch('/api/agent/runs')
   if (!res.ok) return { runs: [] }
   return await res.json()
 }
 
 export async function fetchAgentRunSteps(runId) {
-  const res = await fetch(`/api/agent/runs/${runId}/steps`)
+  const res = await apiFetch(`/api/agent/runs/${runId}/steps`)
   if (!res.ok) throw new Error('Failed to fetch run execution steps')
   return await res.json()
 }
 
 export async function fetchLatestDailyDigest() {
-  const res = await fetch('/api/agent/digests/latest')
+  const res = await apiFetch('/api/agent/digests/latest')
   if (!res.ok) return { digest: null }
   return await res.json()
 }
 
 export async function fetchDailyDigests() {
-  const res = await fetch('/api/agent/digests')
+  const res = await apiFetch('/api/agent/digests')
   if (!res.ok) return { digests: [] }
   return await res.json()
 }
