@@ -19,7 +19,8 @@ import {
   Power,
   ShieldCheck,
   RefreshCw,
-  LogOut
+  LogOut,
+  Sparkles
 } from 'lucide-react'
 
 // Import API client (strict backend integration preserved)
