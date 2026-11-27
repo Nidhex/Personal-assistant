@@ -1018,6 +1018,114 @@ def add_workspace_note(
         }
     }
 
+class YouTubeNotesRequest(BaseModel):
+    url: str
+
+_yt_rate_limits: dict[str, list[float]] = {}
+
+@app.post("/api/youtube/notes")
+async def create_youtube_notes(
+    req: YouTubeNotesRequest,
+    user: dict = Depends(get_current_user)
+):
+    """Fetches YouTube captions, builds timestamped sections, and saves one note in General workspace."""
+    import asyncio
+    from fastapi.responses import JSONResponse
+    from .youtube_service import (
+        YouTubeServiceError,
+        build_timestamp_sections,
+        extract_youtube_video_id,
+        fetch_youtube_transcript,
+    )
+
+    try:
+        video_id = extract_youtube_video_id(req.url)
+    except YouTubeServiceError as e:
+        return JSONResponse(status_code=e.status_code, content={"code": e.code, "detail": e.message})
+
+    # Check for existing saved note for this user & video_id in General workspace before calling YouTube
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, title, content FROM user_workspace_notes WHERE user_id = ? AND workspace_id = 'General' ORDER BY created_at DESC",
+        (user["id"],)
+    )
+    for row in cursor.fetchall():
+        try:
+            saved = json.loads(row["content"] or "{}")
+        except Exception:
+            saved = {}
+        if saved.get("video_id") == video_id:
+            conn.close()
+            return {
+                "success": True,
+                "video_id": video_id,
+                "language_code": saved.get("language_code", "en"),
+                "language": saved.get("language", "English"),
+                "is_generated": bool(saved.get("is_generated", False)),
+                "topics": saved.get("topics", []),
+                "note": {"id": row["id"], "title": row["title"]},
+            }
+    conn.close()
+
+    # Rate limit: 5 caption requests per user per minute
+    now_ts = time.time()
+    recent = [t for t in _yt_rate_limits.get(user["id"], []) if now_ts - t < 60.0]
+    if len(recent) >= 5:
+        return JSONResponse(
+            status_code=429,
+            content={"code": "RATE_LIMIT_EXCEEDED", "detail": "Too many caption requests. Please wait a minute and try again."}
+        )
+    recent.append(now_ts)
+    _yt_rate_limits[user["id"]] = recent
+
+    try:
+        transcript = await asyncio.wait_for(asyncio.to_thread(fetch_youtube_transcript, video_id), timeout=12.0)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=503,
+            content={"code": "CAPTION_SERVICE_UNAVAILABLE", "detail": "Caption retrieval timed out. Try again later or paste the transcript manually."}
+        )
+    except YouTubeServiceError as e:
+        return JSONResponse(status_code=e.status_code, content={"code": e.code, "detail": e.message})
+    except Exception:
+        return JSONResponse(
+            status_code=502,
+            content={"code": "YOUTUBE_NOTES_FAILED", "detail": "Unexpected error retrieving captions. Please try again or use manual transcript paste."}
+        )
+
+    topics = build_timestamp_sections(transcript["snippets"])
+    now_str = datetime.now(timezone.utc).isoformat()
+    note_id = f"not_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    note_title = f"YouTube Notes: {video_id}"
+    note_payload = {
+        "video_url": req.url.strip(),
+        "video_id": video_id,
+        "language_code": transcript["language_code"],
+        "language": transcript["language"],
+        "is_generated": transcript["is_generated"],
+        "topics": topics,
+        "retrieved_at": now_str,
+    }
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at)
+        VALUES (?, 'General', ?, ?, ?, ?, ?)
+    """, (note_id, user["id"], note_title, json.dumps(note_payload), now_str, now_str))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "video_id": video_id,
+        "language_code": transcript["language_code"],
+        "language": transcript["language"],
+        "is_generated": transcript["is_generated"],
+        "topics": topics,
+        "note": {"id": note_id, "title": note_title},
+    }
+
 # -------------------------------------------------------------
 # CALENDAR EVENT ENDPOINTS
 # -------------------------------------------------------------

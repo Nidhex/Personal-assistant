@@ -17,7 +17,7 @@ import {
   ArrowRight,
   ShieldAlert
 } from 'lucide-react'
-import { createUserTask } from '../api'
+import { createUserTask, fetchYouTubeNotes } from '../api'
 
 // Helper to validate YouTube URLs
 function isValidYouTubeUrl(url) {
@@ -146,11 +146,13 @@ export default function StudyView({
   const [revisionPlan, setRevisionPlan] = useState([])
   const [revealedExamAnswers, setRevealedExamAnswers] = useState({})
   const [addingPlanToTasks, setAddingPlanToTasks] = useState(false)
+  const [ytMeta, setYtMeta] = useState(null)
+  const [ytFallbackReason, setYtFallbackReason] = useState('')
 
   // -------------------------------------------------------------
   // PART A HANDLERS (YOUTUBE)
   // -------------------------------------------------------------
-  const handleCheckVideo = (e) => {
+  const handleCheckVideo = async (e) => {
     e.preventDefault()
     if (!ytUrl.trim()) {
       showToast('Please enter a YouTube video URL.')
@@ -163,15 +165,35 @@ export default function StudyView({
     }
 
     setYtStatus('checking')
+    setYtMeta(null)
+    setYtFallbackReason('')
 
-    // Per mandatory requirement: Check transcript availability.
-    // The backend does not have an automated YouTube transcript proxy configured,
-    // so automated scraping without API cannot be assumed or fabricated.
-    setTimeout(() => {
-      // Set mandatory required state: "No transcript available. No notes were created."
-      setYtStatus('no_transcript')
-      showToast('No automated transcript available for this video.')
-    }, 600)
+    try {
+      const data = await fetchYouTubeNotes(ytUrl.trim())
+      setExtractedYtTopics(data.topics || [])
+      setYtMeta({
+        language: data.language || data.language_code || 'English',
+        is_generated: Boolean(data.is_generated),
+        noteTitle: data.note?.title || 'Saved to General workspace',
+      })
+      setYtStatus('ready')
+      showToast('YouTube notes generated and saved.')
+    } catch (err) {
+      const fallbackCodes = new Set([
+        'NO_TRANSCRIPT',
+        'VIDEO_UNAVAILABLE',
+        'TRANSCRIPT_TOO_LARGE',
+        'CAPTION_SERVICE_UNAVAILABLE',
+      ])
+      if (fallbackCodes.has(err.code)) {
+        setYtFallbackReason(err.message)
+        setYtStatus('no_transcript')
+        showToast(err.message)
+      } else {
+        setYtStatus('idle')
+        showToast(err.message || 'Invalid YouTube URL or request failed.')
+      }
+    }
   }
 
   const handleProcessManualTranscript = (e) => {
