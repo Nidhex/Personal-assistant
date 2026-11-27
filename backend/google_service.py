@@ -17,6 +17,17 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8001/api/auth/google/callback")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
+def get_config_val(name: str, default: str = "") -> str:
+    """Resolves configuration value from current Cloudflare Worker env or process env."""
+    try:
+        from .main import current_worker_env
+        env = current_worker_env.get()
+        if env and hasattr(env, name) and getattr(env, name):
+            return str(getattr(env, name))
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
 # Exact permissions requested for initial MVP (strictly read-only)
 GOOGLE_SCOPES = [
     "openid",
@@ -26,12 +37,16 @@ GOOGLE_SCOPES = [
 ]
 
 def is_google_configured() -> bool:
-    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+    cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
+    csecret = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
+    return bool(cid and csecret)
 
 def get_google_auth_url(state: str) -> str:
+    cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
+    redir = get_config_val("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI)
     params = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "client_id": cid,
+        "redirect_uri": redir,
         "response_type": "code",
         "scope": " ".join(GOOGLE_SCOPES),
         "access_type": "offline",
@@ -41,15 +56,18 @@ def get_google_auth_url(state: str) -> str:
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
 async def exchange_code_for_tokens(code: str):
+    cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
+    csecret = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
+    redir = get_config_val("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI)
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
+                "client_id": cid,
+                "client_secret": csecret,
                 "code": code,
                 "grant_type": "authorization_code",
-                "redirect_uri": GOOGLE_REDIRECT_URI
+                "redirect_uri": redir
             },
             timeout=15.0
         )
@@ -110,12 +128,14 @@ async def get_valid_access_token(user_id: str) -> str:
         conn.close()
         raise Exception("Google authorization expired and no refresh token is present. Please reconnect.")
 
+    cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
+    csecret = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
     async with httpx.AsyncClient() as client:
         res = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
+                "client_id": cid,
+                "client_secret": csecret,
                 "refresh_type": "refresh_token",
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token"

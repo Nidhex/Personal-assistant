@@ -6,24 +6,45 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Key for encrypting OAuth tokens at rest
-_ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
-if not _ENCRYPTION_KEY:
-    # Stable fallback key for dev environment if not set
-    _ENCRYPTION_KEY = "amUwv28ARP6pPIJSXavvJB02gs678FhhYcPt_BINE5k="
+DEV_FALLBACK_KEY = "amUwv28ARP6pPIJSXavvJB02gs678FhhYcPt_BINE5k="
 
-fernet = Fernet(_ENCRYPTION_KEY.encode() if isinstance(_ENCRYPTION_KEY, str) else _ENCRYPTION_KEY)
+def get_encryption_key() -> str:
+    """
+    Resolves encryption key from:
+    1. Active Cloudflare Worker environment binding (request context)
+    2. Process environment variable (local .env)
+    3. Stable development fallback key
+    """
+    try:
+        from .main import current_worker_env
+        env = current_worker_env.get()
+        if env and hasattr(env, "ENCRYPTION_KEY") and env.ENCRYPTION_KEY:
+            return str(env.ENCRYPTION_KEY)
+    except Exception:
+        pass
+
+    key = os.getenv("ENCRYPTION_KEY")
+    if key:
+        return key
+    return DEV_FALLBACK_KEY
+
+def get_fernet() -> Fernet:
+    key_str = get_encryption_key()
+    return Fernet(key_str.encode() if isinstance(key_str, str) else key_str)
+
+# Retain module-level fernet for backwards compatibility with existing imports
+fernet = get_fernet()
 
 def encrypt_token(token: str) -> str:
     if not token:
         return ""
-    return fernet.encrypt(token.encode()).decode()
+    return get_fernet().encrypt(token.encode()).decode()
 
 def decrypt_token(encrypted_token: str) -> str:
     if not encrypted_token:
         return ""
     try:
-        return fernet.decrypt(encrypted_token.encode()).decode()
+        return get_fernet().decrypt(encrypted_token.encode()).decode()
     except Exception:
         return ""
 

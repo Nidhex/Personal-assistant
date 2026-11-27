@@ -343,31 +343,33 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
                     draft_body = f"Hello {msg.get('senderName', '')},\n\nI have received your email regarding '{subject}'. I am reviewing it and will follow up shortly.\n\nBest regards,\n{msg.get('senderName', 'User')}"
 
                     conn = get_db()
-                    cursor = conn.cursor()
-                    # Check duplicate approval
-                    cursor.execute("SELECT id FROM user_approvals WHERE user_id = ? AND subject LIKE ? AND status = 'pending'", (user_id, f"%{subject[:30]}%"))
-                    if not cursor.fetchone():
-                        cursor.execute("""
-                            INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
-                            VALUES (?, ?, 'Email Draft', ?, ?, ?, 'Medium', ?, 'pending', ?)
-                        """, (
-                            appr_id, user_id, msg.get("senderEmail", "sender@domain.com"),
-                            f"Re: {subject}", "Daily agent formulated reply; requires human review before dispatch.",
-                            draft_body, datetime.now(timezone.utc).isoformat()
-                        ))
-                        conn.commit()
-                        staged_approvals.append(f"Re: {subject} (To: {msg.get('senderName', 'Sender')})")
-                        actions_completed += 1
+                    try:
+                        cursor = conn.cursor()
+                        # Check duplicate approval
+                        cursor.execute("SELECT id FROM user_approvals WHERE user_id = ? AND subject LIKE ? AND status = 'pending'", (user_id, f"%{subject[:30]}%"))
+                        if not cursor.fetchone():
+                            cursor.execute("""
+                                INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
+                                VALUES (?, ?, 'Email Draft', ?, ?, ?, 'Medium', ?, 'pending', ?)
+                            """, (
+                                appr_id, user_id, msg.get("senderEmail", "sender@domain.com"),
+                                f"Re: {subject}", "Daily agent formulated reply; requires human review before dispatch.",
+                                draft_body, datetime.now(timezone.utc).isoformat()
+                            ))
+                            conn.commit()
+                            staged_approvals.append(f"Re: {subject} (To: {msg.get('senderName', 'Sender')})")
+                            actions_completed += 1
 
-                        log_run_step(
-                            run_id, user_id, step_num, f"Stage Draft Reply: {subject[:30]}",
-                            "propose_draft", "Queued for Human Approval", "completed",
-                            f"Staged outbound email draft in user_approvals (ID: {appr_id}). Action remains paused until approved.",
-                            {"subject": f"Re: {subject}", "target": msg.get("senderEmail", "")},
-                            approval_required=True
-                        )
-                        step_num += 1
-                    conn.close()
+                            log_run_step(
+                                run_id, user_id, step_num, f"Stage Draft Reply: {subject[:30]}",
+                                "propose_draft", "Queued for Human Approval", "completed",
+                                f"Staged outbound email draft in user_approvals (ID: {appr_id}). Action remains paused until approved.",
+                                {"subject": f"Re: {subject}", "target": msg.get("senderEmail", "")},
+                                approval_required=True
+                            )
+                            step_num += 1
+                    finally:
+                        conn.close()
 
         # Step 5: Read Tasks & Calendar Events
         conn = get_db()

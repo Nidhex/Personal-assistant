@@ -2,8 +2,9 @@ import os
 import sys
 import time
 import json
+import contextvars
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Optional, List, Any
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
@@ -34,10 +35,28 @@ from .google_service import (
 
 load_dotenv()
 
-# Initialize DB on startup
-init_db()
+# Global ContextVar storing Cloudflare Worker environment bindings per request
+current_worker_env: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("current_worker_env", default=None)
+
+# Initialize DB on startup (SQLite in local dev, D1 initialized via migration in production)
+try:
+    init_db()
+except Exception:
+    # Allows import in environments where local SQLite filesystem is read-only
+    pass
 
 app = FastAPI(title="Personal Assistant API", version="1.0.0")
+
+# Cloudflare Python Worker environment binding middleware
+@app.middleware("http")
+async def cloudflare_worker_env_middleware(request: Request, call_next):
+    env = request.scope.get("env")
+    token = current_worker_env.set(env)
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        current_worker_env.reset(token)
 
 # CORS configuration
 app.add_middleware(
@@ -50,7 +69,10 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
-    scheduler.start()
+    # Only start background ticker loop when running in traditional server mode (uvicorn)
+    # In Cloudflare Workers, scheduled tasks are handled by Cron Triggers via scheduled() handler
+    if os.getenv("CF_PAGES") != "1" and os.getenv("WORKER_ENV") != "1":
+        scheduler.start()
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -602,7 +624,6 @@ def create_task(req: CreateTaskRequest, user: dict = Depends(get_current_user)):
     return {"success": True, "id": task_id, "title": clean_title}
 
 @app.put("/api/user/tasks/{task_id}")
-@app.patch("/api/user/tasks/{task_id}")
 def update_task_endpoint(task_id: str, req: UpdateTaskRequest, user: dict = Depends(get_current_user)):
     conn = get_db()
     cursor = conn.cursor()
@@ -642,19 +663,6 @@ def update_task_endpoint(task_id: str, req: UpdateTaskRequest, user: dict = Depe
         }
     }
 
-@app.delete("/api/user/tasks/{task_id}")
-def delete_task_endpoint(task_id: str, user: dict = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM user_tasks WHERE id = ? AND user_id = ?", (task_id, user["id"]))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Task not found.")
-    cursor.execute("DELETE FROM user_tasks WHERE id = ? AND user_id = ?", (task_id, user["id"]))
-    conn.commit()
-    conn.close()
-    return {"success": True}
-
 @app.post("/api/user/tasks/{task_id}/toggle")
 def toggle_task(task_id: str, user: dict = Depends(get_current_user)):
     conn = get_db()
@@ -671,13 +679,13 @@ def toggle_task(task_id: str, user: dict = Depends(get_current_user)):
     conn.close()
     return {"success": True, "completed": bool(new_val)}
 
-class UpdateTaskRequest(BaseModel):
+class PatchTaskRequest(BaseModel):
     title: Optional[str] = None
     due_date: Optional[str] = None
     priority: Optional[str] = None
 
 @app.patch("/api/user/tasks/{task_id}")
-def update_task(task_id: str, req: UpdateTaskRequest, user: dict = Depends(get_current_user)):
+def update_task(task_id: str, req: PatchTaskRequest, user: dict = Depends(get_current_user)):
     import uuid
     if req.title is None and req.due_date is None and req.priority is None:
         raise HTTPException(status_code=400, detail="At least one field must be provided.")

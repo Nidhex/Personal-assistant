@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "deskagent-backend",
+  "main": "worker.py",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": [
+    "python_workers"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "deskagent-db",
+      "database_id": "1a348cda-3a94-49ac-8231-b58926cc8d67",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "*/15 * * * *"
+    ]
+  },
+  "vars": {
+    "ENVIRONMENT": "production",
+    "COOKIE_SECURE": "true",
+    "DEV_TEST_MODE": "false",
+    "FRONTEND_URL": "https://deskagent.pages.dev",
+    "GOOGLE_REDIRECT_URI": "https://deskagent-backend.<your-subdomain>.workers.dev/api/auth/google/callback"
+  }
+}

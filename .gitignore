@@ -8,6 +8,7 @@
 *.sqlite
 *.sqlite3
 backend/data.db
+migrations/data_export.sql
 
 # Python bytecode & virtual environments
 __pycache__/
@@ -16,6 +17,9 @@ __pycache__/
 backend/__pycache__/
 backend/.venv/
 .venv/
+.venv-workers/
+python_modules/
+.wrangler/
 venv/
 ENV/
 
