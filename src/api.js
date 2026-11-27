@@ -4,9 +4,20 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 async function apiFetch(url, options = {}) {
   const fullUrl = url.startsWith('/') ? `${API_BASE}${url}` : url
+  const headers = { ...(options.headers || {}) }
+
+  // Dual cookie/bearer session token support (for mobile and cross-origin resilience)
+  try {
+    const token = typeof window !== 'undefined' ? localStorage.getItem('deskagent_session_id') : null
+    if (token && !headers['Authorization']) {
+      headers['Authorization'] = `Bearer ${token}`
+    }
+  } catch {}
+
   const opts = {
     credentials: 'include',
-    ...options
+    ...options,
+    headers
   }
   return fetch(fullUrl, opts)
 }
@@ -48,6 +59,9 @@ export async function getGoogleAuthUrl() {
 
 export async function logoutUser() {
   try {
+    try {
+      if (typeof window !== 'undefined') localStorage.removeItem('deskagent_session_id')
+    } catch {}
     const res = await apiFetch('/api/auth/logout', { method: 'POST' })
     return await res.json()
   } catch (err) {

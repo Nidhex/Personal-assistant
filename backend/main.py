@@ -29,6 +29,10 @@ from .google_service import (
     fetch_gmail_messages,
     fetch_gmail_message_detail,
     revoke_user_tokens,
+    get_frontend_url,
+    is_production,
+    is_cookie_secure,
+    is_dev_test_mode,
     FRONTEND_URL,
     GOOGLE_SCOPES
 )
@@ -68,7 +72,7 @@ app.add_middleware(
         "https://deskagent.hacckthon.workers.dev",
         "https://deskagent-backend.hacckthon.workers.dev",
     ],
-    allow_origin_regex=r"^https://.*(\.pages\.dev|\.workers\.dev)$",
+    allow_origin_regex=r"^(https://.*(\.pages\.dev|\.workers\.dev)|http://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -356,7 +360,7 @@ def get_terms_page():
 # AUTH & OAUTH ROUTES
 # -------------------------------------------------------------
 @app.get("/api/auth/status")
-def auth_status():
+def auth_status(request: Request):
     """Returns Google OAuth configuration readiness and dev mode flag."""
     from .google_service import get_config_val, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
     cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
@@ -369,7 +373,7 @@ def auth_status():
         missing.append("GOOGLE_CLIENT_SECRET")
     return {
         "google_configured": configured,
-        "dev_test_mode_enabled": DEV_TEST_MODE,
+        "dev_test_mode_enabled": is_dev_test_mode(request),
         "missing_keys": missing,
         "scopes_requested": GOOGLE_SCOPES
     }
@@ -393,7 +397,7 @@ def get_me(request: Request):
     }
 
 @app.get("/api/auth/google/url")
-def get_auth_url(user: Optional[dict] = Depends(get_current_user_optional)):
+def get_auth_url(request: Request, user: Optional[dict] = Depends(get_current_user_optional)):
     """Generates secure state and returns official Google OAuth URL."""
     if not is_google_configured():
         raise HTTPException(
@@ -412,21 +416,24 @@ def get_auth_url(user: Optional[dict] = Depends(get_current_user_optional)):
     conn.commit()
     conn.close()
 
-    url = get_google_auth_url(state)
+    url = get_google_auth_url(state, request=request)
     return {"auth_url": url}
 
 @app.get("/api/auth/google/callback")
 async def google_callback(
+    request: Request,
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None
 ):
     """Handles Google redirect, exchanges code, verifies state, sets session cookie."""
+    frontend_base = get_frontend_url(request)
+
     if error:
-        return RedirectResponse(f"{FRONTEND_URL}/?auth_error={error}")
+        return RedirectResponse(f"{frontend_base}/?auth_error={error}")
 
     if not code or not state:
-        return RedirectResponse(f"{FRONTEND_URL}/?auth_error=missing_parameters")
+        return RedirectResponse(f"{frontend_base}/?auth_error=missing_parameters")
 
     # Validate state CSRF
     conn = get_db()
@@ -436,7 +443,7 @@ async def google_callback(
 
     if not row or is_expired(row["expires_at"]):
         conn.close()
-        return RedirectResponse(f"{FRONTEND_URL}/?auth_error=invalid_or_expired_state")
+        return RedirectResponse(f"{frontend_base}/?auth_error=invalid_or_expired_state")
 
     # Remove used state
     cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
@@ -444,7 +451,7 @@ async def google_callback(
 
     try:
         # Exchange code for tokens
-        token_data = await exchange_code_for_tokens(code)
+        token_data = await exchange_code_for_tokens(code, request=request)
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
         expires_in = token_data.get("expires_in", 3600)
@@ -517,20 +524,29 @@ async def google_callback(
         conn.close()
 
         # Set HTTP-only session cookie and redirect
-        response = RedirectResponse(f"{FRONTEND_URL}/?auth_success=1")
+        response = RedirectResponse(f"{frontend_base}/?auth_success=1&sid={session_id}")
+
+        from urllib.parse import urlparse
+        callback_host = request.headers.get("host", "").split(":")[0].lower() if request else ""
+        frontend_host = urlparse(frontend_base).hostname or ""
+        is_cross_site = bool(callback_host and frontend_host and callback_host != frontend_host)
+
+        cookie_samesite = "none" if (is_production(request) and is_cross_site) else "lax"
+        cookie_secure = is_cookie_secure(request)
+
         response.set_cookie(
             key="session_id",
             value=session_id,
             httponly=True,
-            samesite="none" if IS_PRODUCTION else "lax",
-            secure=True if IS_PRODUCTION else COOKIE_SECURE,
+            samesite=cookie_samesite,
+            secure=cookie_secure,
             max_age=7 * 24 * 3600
         )
         return response
 
     except Exception as e:
         conn.close()
-        return RedirectResponse(f"{FRONTEND_URL}/?auth_error={str(e)}")
+        return RedirectResponse(f"{frontend_base}/?auth_error={str(e)}")
 
 @app.post("/api/auth/logout")
 def logout(request: Request, response: Response):
@@ -548,7 +564,7 @@ def logout(request: Request, response: Response):
         conn.close()
 
     res = JSONResponse({"success": True, "message": "Signed out successfully."})
-    res.delete_cookie(key="session_id", samesite="lax", httponly=True, secure=COOKIE_SECURE)
+    res.delete_cookie(key="session_id", samesite="lax", httponly=True, secure=is_cookie_secure(request))
     return res
 
 # -------------------------------------------------------------
@@ -560,12 +576,12 @@ class DevLoginRequest(BaseModel):
     name: Optional[str] = "Test Developer"
 
 @app.post("/api/auth/dev-login")
-def dev_login(req: DevLoginRequest, response: Response):
+def dev_login(req: DevLoginRequest, request: Request, response: Response):
     """Only enabled when DEV_TEST_MODE=true in .env for local offline testing."""
-    if not DEV_TEST_MODE:
+    if not is_dev_test_mode(request):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Development test login is disabled. Configure Google OAuth in .env to sign in."
+            detail="Development test login is disabled in production."
         )
 
     conn = get_db()
@@ -590,7 +606,7 @@ def dev_login(req: DevLoginRequest, response: Response):
         value=session_id,
         httponly=True,
         samesite="lax",
-        secure=COOKIE_SECURE,
+        secure=is_cookie_secure(request),
         max_age=7 * 24 * 3600
     )
     return res

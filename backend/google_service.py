@@ -28,6 +28,90 @@ def get_config_val(name: str, default: str = "") -> str:
         pass
     return os.getenv(name, default)
 
+def is_production(request=None) -> bool:
+    """
+    Determines whether the application is running in production.
+    Checks Worker bindings, process env, Worker runtime flags, and request headers.
+    """
+    env_str = get_config_val("ENVIRONMENT", "").lower()
+    if env_str == "production":
+        return True
+    if os.getenv("ENVIRONMENT", "").lower() == "production":
+        return True
+    if os.getenv("WORKER_ENV") == "1" or os.getenv("CF_PAGES") == "1":
+        return True
+    try:
+        from .main import current_worker_env
+        w_env = current_worker_env.get()
+        if w_env is not None:
+            w_val = getattr(w_env, "ENVIRONMENT", None)
+            if w_val and str(w_val).lower() == "production":
+                return True
+            return True
+    except Exception:
+        pass
+    if request:
+        req_env = request.scope.get("env") if hasattr(request, "scope") else None
+        if req_env:
+            w_val = getattr(req_env, "ENVIRONMENT", None)
+            if w_val and str(w_val).lower() == "production":
+                return True
+        host = request.headers.get("host", "").lower() if hasattr(request, "headers") else ""
+        if "workers.dev" in host or "pages.dev" in host:
+            return True
+    return False
+
+def get_frontend_url(request=None) -> str:
+    """
+    Resolves the canonical frontend URL in an environment-aware manner.
+    Guarantees that production requests NEVER redirect to localhost.
+    In local development, dynamically resolves LAN IP for mobile dev testing.
+    """
+    configured_url = get_config_val("FRONTEND_URL", "").strip().rstrip("/")
+    is_prod = is_production(request)
+
+    if is_prod:
+        is_configured_localhost = "localhost" in configured_url or "127.0.0.1" in configured_url
+        if configured_url and not is_configured_localhost:
+            return configured_url
+        return "https://deskagent.hacckthon.workers.dev"
+
+    # In local development: check if request originates from a LAN IP (e.g. mobile testing on Wi-Fi)
+    if request and hasattr(request, "headers"):
+        host = request.headers.get("host", "")
+        if "workers.dev" in host or "pages.dev" in host:
+            return "https://deskagent.hacckthon.workers.dev"
+        if ":" in host:
+            host_name = host.split(":")[0]
+            if host_name not in ["localhost", "127.0.0.1", "testserver"]:
+                proto = request.headers.get("x-forwarded-proto", "http")
+                return f"{proto}://{host_name}:5173"
+
+    if configured_url:
+        return configured_url
+
+    return os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
+def is_cookie_secure(request=None) -> bool:
+    if is_production(request):
+        return True
+    c_sec = get_config_val("COOKIE_SECURE", "")
+    if c_sec.lower() == "true":
+        return True
+    if os.getenv("COOKIE_SECURE", "false").lower() == "true":
+        return True
+    if request and hasattr(request, "url") and getattr(request.url, "scheme", "") == "https":
+        return True
+    return False
+
+def is_dev_test_mode(request=None) -> bool:
+    if is_production(request):
+        return False
+    d_val = get_config_val("DEV_TEST_MODE", "")
+    if d_val.lower() == "true":
+        return True
+    return os.getenv("DEV_TEST_MODE", "false").lower() == "true"
+
 # Exact permissions requested for initial MVP (strictly read-only)
 GOOGLE_SCOPES = [
     "openid",
@@ -41,9 +125,11 @@ def is_google_configured() -> bool:
     csecret = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
     return bool(cid and csecret)
 
-def get_google_auth_url(state: str) -> str:
+def get_google_auth_url(state: str, request=None) -> str:
     cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
     redir = get_config_val("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI)
+    if is_production(request) and ("localhost" in redir or "127.0.0.1" in redir or not redir):
+        redir = "https://deskagent.hacckthon.workers.dev/api/auth/google/callback"
     params = {
         "client_id": cid,
         "redirect_uri": redir,
@@ -55,10 +141,12 @@ def get_google_auth_url(state: str) -> str:
     }
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
-async def exchange_code_for_tokens(code: str):
+async def exchange_code_for_tokens(code: str, request=None):
     cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
     csecret = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
     redir = get_config_val("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI)
+    if is_production(request) and ("localhost" in redir or "127.0.0.1" in redir or not redir):
+        redir = "https://deskagent.hacckthon.workers.dev/api/auth/google/callback"
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",

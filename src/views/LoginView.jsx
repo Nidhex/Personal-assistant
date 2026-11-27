@@ -143,7 +143,7 @@ export default function LoginView({
               <div className="bg-[#F7F4EB] border border-[#DEDAD0] p-2.5 rounded-lg font-mono text-[10px] text-[#4B5563] space-y-0.5">
                 <div>GOOGLE_CLIENT_ID=your_id.apps.googleusercontent.com</div>
                 <div>GOOGLE_CLIENT_SECRET=your_secret</div>
-                <div>GOOGLE_REDIRECT_URI=http://localhost:8001/api/auth/google/callback</div>
+                <div>GOOGLE_REDIRECT_URI={typeof window !== 'undefined' ? `${window.location.origin}/api/auth/google/callback` : 'https://deskagent.hacckthon.workers.dev/api/auth/google/callback'}</div>
               </div>
             </div>
           )}

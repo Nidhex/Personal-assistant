@@ -96,7 +96,13 @@ export default function App() {
     if (params.get('auth_error')) {
       setAuthError(params.get('auth_error'))
     }
-    if (params.get('auth_success') || params.get('auth_error')) {
+    const sid = params.get('sid')
+    if (sid) {
+      try {
+        localStorage.setItem('deskagent_session_id', sid)
+      } catch {}
+    }
+    if (params.get('auth_success') || params.get('auth_error') || sid) {
       window.history.replaceState({}, document.title, window.location.pathname)
     }
   }, [])
