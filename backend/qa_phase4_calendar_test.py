@@ -196,25 +196,57 @@ class QAPhase4CalendarTestSuite(unittest.TestCase):
         self.assertIsNotNone(evt)
         self.assertEqual(evt["title"], "Study Revision Session")
 
-        # 2. Reschedule via chatbot
+        # 2. Reschedule via chatbot (Mandatory approval required; does NOT mutate DB immediately)
         res2 = run_agent_turn(
             user_id=self.alice_id,
             workspace_id="main",
             prompt="Reschedule my Study Revision Session to 14:00"
         )
         self.assertEqual(res2["tool_executed"], "update_calendar_event")
-        self.assertIn("rescheduled", res2["text"].lower())
+        self.assertTrue(res2.get("approval_required"))
+        self.assertIn("reschedule", res2["text"].lower())
+        appr_id_2 = res2["approval_id"]
 
-        # 3. Cancel/Delete via chatbot
+        # Verify DB is UNCHANGED before human approval
+        self.cursor.execute("SELECT start_time FROM user_calendar_events WHERE user_id = ?", (self.alice_id,))
+        self.assertNotEqual(self.cursor.fetchone()["start_time"], "14:00")
+
+        # Human approves the reschedule request
+        appr_resp2 = self.client.post(
+            f"/api/user/approvals/{appr_id_2}/action",
+            json={"action": "approve"},
+            cookies={"session_id": self.alice_session}
+        )
+        self.assertEqual(appr_resp2.status_code, 200)
+
+        # Verify DB updated AFTER approval
+        self.cursor.execute("SELECT start_time FROM user_calendar_events WHERE user_id = ?", (self.alice_id,))
+        self.assertEqual(self.cursor.fetchone()["start_time"], "14:00")
+
+        # 3. Cancel/Delete via chatbot (Mandatory approval required; does NOT mutate DB immediately)
         res3 = run_agent_turn(
             user_id=self.alice_id,
             workspace_id="main",
             prompt="Cancel my Study Revision Session"
         )
         self.assertEqual(res3["tool_executed"], "delete_calendar_event")
-        self.assertIn("canceled", res3["text"].lower())
+        self.assertTrue(res3.get("approval_required"))
+        self.assertIn("cancel", res3["text"].lower())
+        appr_id_3 = res3["approval_id"]
 
-        # Verify deleted in DB
+        # Verify DB is NOT deleted before approval
+        self.cursor.execute("SELECT id FROM user_calendar_events WHERE user_id = ?", (self.alice_id,))
+        self.assertIsNotNone(self.cursor.fetchone())
+
+        # Human approves the cancellation
+        appr_resp3 = self.client.post(
+            f"/api/user/approvals/{appr_id_3}/action",
+            json={"action": "approve"},
+            cookies={"session_id": self.alice_session}
+        )
+        self.assertEqual(appr_resp3.status_code, 200)
+
+        # Verify deleted in DB AFTER approval
         self.cursor.execute("SELECT id FROM user_calendar_events WHERE user_id = ?", (self.alice_id,))
         self.assertIsNone(self.cursor.fetchone())
 

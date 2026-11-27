@@ -62,20 +62,30 @@ async def cloudflare_worker_env_middleware(request: Request, call_next):
     finally:
         current_worker_env.reset(token)
 
-# CORS configuration
+# CORS configuration - Strict explicit allowlist without wildcards
+ALLOWED_CORS_ORIGINS = [
+    "https://deskagent.hacckthon.workers.dev",
+    "https://deskagent-backend.hacckthon.workers.dev",
+    "https://deskagent.pages.dev",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+_env_fe = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+if _env_fe and _env_fe not in ALLOWED_CORS_ORIGINS:
+    ALLOWED_CORS_ORIGINS.append(_env_fe)
+_allowed_extra = os.getenv("ALLOWED_ORIGINS", "")
+if _allowed_extra:
+    for o in _allowed_extra.split(","):
+        o = o.strip().rstrip("/")
+        if o and o not in ALLOWED_CORS_ORIGINS:
+            ALLOWED_CORS_ORIGINS.append(o)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://deskagent.pages.dev",
-        "https://deskagent.hacckthon.workers.dev",
-        "https://deskagent-backend.hacckthon.workers.dev",
-    ],
-    allow_origin_regex=r"^(https://.*(\.pages\.dev|\.workers\.dev)|http://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?)$",
+    allow_origins=ALLOWED_CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Cookie", "X-Requested-With", "Accept"],
 )
 
 @app.on_event("startup")
@@ -527,12 +537,13 @@ async def google_callback(
         conn.commit()
         conn.close()
 
-        # Set HTTP-only session cookie and redirect
-        response = RedirectResponse(f"{frontend_base}/?auth_success=1&sid={session_id}")
+        # Set HTTP-only session cookie and redirect without exposing session IDs in URLs
+        response = RedirectResponse(f"{frontend_base}/?auth_success=1")
 
         from urllib.parse import urlparse
-        callback_host = request.headers.get("host", "").split(":")[0].lower() if request else ""
-        frontend_host = urlparse(frontend_base).hostname or ""
+        raw_host = (request.headers.get("x-forwarded-host") or request.headers.get("host", "")) if request else ""
+        callback_host = raw_host.split(",")[0].split(":")[0].strip().lower()
+        frontend_host = (urlparse(frontend_base).hostname or "").lower()
         is_cross_site = bool(callback_host and frontend_host and callback_host != frontend_host)
 
         cookie_samesite = "none" if (is_production(request) and is_cross_site) else "lax"
@@ -1028,8 +1039,10 @@ class ApprovalActionRequest(BaseModel):
 def handle_approval_action(approval_id: str, req: ApprovalActionRequest, user: dict = Depends(get_current_user)):
     conn = get_db()
     cursor = conn.cursor()
+
+    # Verify approval exists and belongs to the authenticated user (strict user isolation & anti-probing 404)
     cursor.execute(
-        "SELECT id, type, draft_content, status FROM user_approvals WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at FROM user_approvals WHERE id = ? AND user_id = ?",
         (approval_id, user["id"])
     )
     row = cursor.fetchone()
@@ -1037,18 +1050,55 @@ def handle_approval_action(approval_id: str, req: ApprovalActionRequest, user: d
         conn.close()
         raise HTTPException(status_code=404, detail="Approval item not found.")
 
-    if req.action == "approve" and row["type"] == "Task Proposal":
+    curr_status = row["status"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    raw_draft = row["draft_content"] or "{}"
+    try:
+        payload = json.loads(raw_draft)
+    except Exception:
+        payload = {}
+
+    approval_type = row["type"]
+
+    # Reject flow
+    if req.action == "reject":
         cursor.execute(
-            "UPDATE user_approvals SET status = 'approved' WHERE id = ? AND user_id = ? AND status = 'pending'",
+            "UPDATE user_approvals SET status = 'rejected' WHERE id = ? AND user_id = ? AND status = 'pending'",
             (approval_id, user["id"])
         )
         if cursor.rowcount == 1:
-            try:
-                payload = json.loads(row["draft_content"] or "{}")
-            except Exception:
-                payload = {}
+            cursor.execute("""
+                INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                VALUES (?, ?, ?, 'Blocked', '0ms', ?, ?)
+            """, (
+                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                user["id"],
+                f"Approval: {approval_id}",
+                f"User rejected {approval_type}: {row['subject']}",
+                now_iso
+            ))
+            conn.commit()
+
+        cursor.execute("SELECT status FROM user_approvals WHERE id = ? AND user_id = ?", (approval_id, user["id"]))
+        current = cursor.fetchone()
+        conn.close()
+        return {"success": True, "status": current["status"] if current else "rejected"}
+
+    if req.action != "approve":
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Invalid approval action: '{req.action}'. Expected 'approve' or 'reject'.")
+
+    # Atomic state transition from 'pending' to 'approved'
+    cursor.execute(
+        "UPDATE user_approvals SET status = 'approved' WHERE id = ? AND user_id = ? AND status = 'pending'",
+        (approval_id, user["id"])
+    )
+
+    if cursor.rowcount == 1:
+        # First time winning execution: execute only the approved action
+        # 1. Task Proposal
+        if approval_type == "Task Proposal":
             task_id = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{os.urandom(2).hex()}"
-            now_iso = datetime.now(timezone.utc).isoformat()
             cursor.execute("""
                 INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
                 VALUES (?, ?, ?, 'Agent Proposal', ?, ?, ?, 0, ?, ?)
@@ -1074,18 +1124,127 @@ def handle_approval_action(approval_id: str, req: ApprovalActionRequest, user: d
             ))
             conn.commit()
             conn.close()
-            return {"success": True, "status": "approved"}
+            return {"success": True, "status": "approved", "created_task_id": task_id}
 
-        cursor.execute("SELECT status FROM user_approvals WHERE id = ? AND user_id = ?", (approval_id, user["id"]))
-        current = cursor.fetchone()
+        # 2. Calendar Deletion
+        if approval_type in ["Calendar Deletion", "delete_calendar_event"]:
+            event_id = payload.get("event_id")
+            if not event_id:
+                conn.close()
+                raise HTTPException(status_code=400, detail="Invalid calendar deletion approval: missing event_id.")
+
+            # Revalidate that exact event ID still exists and belongs to this user
+            cursor.execute("SELECT id, title, event_date FROM user_calendar_events WHERE id = ? AND user_id = ?", (event_id, user["id"]))
+            cal_row = cursor.fetchone()
+            if not cal_row:
+                # Never substitute another event if the original disappears!
+                cursor.execute("""
+                    INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                    VALUES (?, ?, ?, 'Failed', '0ms', ?, ?)
+                """, (
+                    f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                    user["id"],
+                    f"Approval: {approval_id}",
+                    "Target calendar event was not found or already deleted. Deletion aborted.",
+                    now_iso
+                ))
+                conn.commit()
+                conn.close()
+                raise HTTPException(status_code=404, detail="Target calendar event was not found or already deleted. Deletion aborted.")
+
+            # Execute only the approved deletion on exact event ID
+            cursor.execute("DELETE FROM user_calendar_events WHERE id = ? AND user_id = ?", (event_id, user["id"]))
+            cursor.execute("""
+                INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
+            """, (
+                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                user["id"],
+                f"Approval: {approval_id}",
+                f"Deleted calendar event: {cal_row['title']}",
+                now_iso
+            ))
+            conn.commit()
+            conn.close()
+            return {"success": True, "status": "approved", "deleted_event_id": event_id}
+
+        # 3. Calendar Update
+        if approval_type in ["Calendar Update", "update_calendar_event"]:
+            event_id = payload.get("event_id")
+            if not event_id:
+                conn.close()
+                raise HTTPException(status_code=400, detail="Invalid calendar update approval: missing event_id.")
+
+            # Revalidate that exact event ID still exists and belongs to this user
+            cursor.execute("SELECT id, title, event_date, start_time, end_time FROM user_calendar_events WHERE id = ? AND user_id = ?", (event_id, user["id"]))
+            cal_row = cursor.fetchone()
+            if not cal_row:
+                cursor.execute("""
+                    INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                    VALUES (?, ?, ?, 'Failed', '0ms', ?, ?)
+                """, (
+                    f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                    user["id"],
+                    f"Approval: {approval_id}",
+                    "Target calendar event was not found. Update aborted.",
+                    now_iso
+                ))
+                conn.commit()
+                conn.close()
+                raise HTTPException(status_code=404, detail="Target calendar event was not found. Update aborted.")
+
+            updated_date = payload.get("event_date") or cal_row["event_date"]
+            updated_start = payload.get("start_time") or cal_row["start_time"]
+            updated_end = payload.get("end_time") or cal_row["end_time"]
+
+            # Revalidate conflicts before execution
+            from .agent import detect_calendar_conflicts
+            conflicts = [c for c in detect_calendar_conflicts(user["id"], updated_date, updated_start, updated_end) if c["id"] != event_id]
+            if conflicts:
+                c = conflicts[0]
+                conn.close()
+                raise HTTPException(status_code=409, detail=f"Conflict detected with '{c['title']}' ({c['start_time']} - {c['end_time']}) on {updated_date}.")
+
+            cursor.execute("""
+                UPDATE user_calendar_events
+                SET event_date = ?, start_time = ?, end_time = ?
+                WHERE id = ? AND user_id = ?
+            """, (updated_date, updated_start, updated_end, event_id, user["id"]))
+            cursor.execute("""
+                INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
+            """, (
+                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                user["id"],
+                f"Approval: {approval_id}",
+                f"Rescheduled calendar event: {cal_row['title']} to {updated_date} ({updated_start} - {updated_end})",
+                now_iso
+            ))
+            conn.commit()
+            conn.close()
+            return {"success": True, "status": "approved", "updated_event_id": event_id}
+
+        # 4. Outbound Email Draft or generic approved action
+        cursor.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
+        """, (
+            f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+            user["id"],
+            f"Approval: {approval_id}",
+            f"Approved action: {approval_type}",
+            now_iso
+        ))
+        conn.commit()
         conn.close()
-        return {"success": True, "status": current["status"] if current else row["status"]}
+        return {"success": True, "status": "approved"}
 
-    new_status = "approved" if req.action == "approve" else "rejected"
-    cursor.execute("UPDATE user_approvals SET status = ? WHERE id = ? AND user_id = ?", (new_status, approval_id, user["id"]))
-    conn.commit()
+    # Already processed / concurrent duplicate / idempotent retry:
+    # Do NOT execute action again; return existing status
+    cursor.execute("SELECT status FROM user_approvals WHERE id = ? AND user_id = ?", (approval_id, user["id"]))
+    current = cursor.fetchone()
     conn.close()
-    return {"success": True, "status": new_status}
+    return {"success": True, "status": current["status"] if current else curr_status}
 
 # -------------------------------------------------------------
 # CHAT & CONVERSATION ENDPOINTS (USER & WORKSPACE ISOLATED)
@@ -1183,7 +1342,7 @@ def get_conversation_messages(
 
 class SendMessageRequest(BaseModel):
     content: str
-    kill_switch_active: Optional[bool] = False
+    kill_switch_active: Optional[bool] = None  # Deprecated; backend persistent setting is authoritative
 
 @app.post("/api/chat/conversations/{conversation_id}/messages")
 async def send_chat_message(
@@ -1229,12 +1388,17 @@ async def send_chat_message(
     # Run Planner
     raw_planner_output = await query_llm_planner(req.content.strip(), context)
 
-    # Run Policy Gate & Tool Runner
+    # Authoritative check: retrieve current user's kill switch setting from persistent storage
+    cursor.execute("SELECT kill_switch_enabled FROM user_agent_settings WHERE user_id = ?", (user["id"],))
+    ks_row = cursor.fetchone()
+    authoritative_kill_switch = bool(ks_row["kill_switch_enabled"] if isinstance(ks_row, dict) else ks_row[0]) if ks_row else False
+
+    # Run Policy Gate & Tool Runner with authoritative saved setting
     execution_result = await execute_policy_gate_and_tools(
         model_output=raw_planner_output,
         user_id=user["id"],
         workspace_id=workspace_id,
-        kill_switch_active=bool(req.kill_switch_active)
+        kill_switch_active=authoritative_kill_switch
     )
 
     assistant_msg_id = f"msg_{int(time.time()*1000)}_a"

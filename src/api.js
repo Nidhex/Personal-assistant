@@ -6,14 +6,6 @@ async function apiFetch(url, options = {}) {
   const fullUrl = url.startsWith('/') ? `${API_BASE}${url}` : url
   const headers = { ...(options.headers || {}) }
 
-  // Dual cookie/bearer session token support (for mobile and cross-origin resilience)
-  try {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('deskagent_session_id') : null
-    if (token && !headers['Authorization']) {
-      headers['Authorization'] = `Bearer ${token}`
-    }
-  } catch {}
-
   const opts = {
     credentials: 'include',
     ...options,

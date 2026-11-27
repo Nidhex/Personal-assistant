@@ -163,17 +163,17 @@ export default function App() {
   }
 
   useEffect(() => {
+    // Purge any legacy session token from browser storage
+    try {
+      localStorage.removeItem('deskagent_session_id')
+      sessionStorage.removeItem('deskagent_session_id')
+    } catch {}
+
     const params = new URLSearchParams(window.location.search)
     if (params.get('auth_error')) {
       setAuthError(params.get('auth_error'))
     }
-    const sid = params.get('sid')
-    if (sid) {
-      try {
-        localStorage.setItem('deskagent_session_id', sid)
-      } catch {}
-    }
-    if (params.get('auth_success') || params.get('auth_error') || sid) {
+    if (params.get('auth_success') || params.get('auth_error')) {
       window.history.replaceState({}, document.title, window.location.pathname)
     }
 

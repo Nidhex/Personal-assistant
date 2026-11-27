@@ -161,7 +161,8 @@ async def test_oauth_callback_success_and_session_persistence():
             location = resp.headers["location"]
             assert location.startswith("https://deskagent.hacckthon.workers.dev/?auth_success=1")
             assert "localhost" not in location
-            assert "sid=" in location
+            assert "sid=" not in location
+            assert "session_id=" not in location
 
             # Assert cookie attributes
             set_cookie = resp.headers.get("set-cookie", "")

@@ -1,6 +1,5 @@
-import httpx
-import sqlite3
-from pathlib import Path
+from fastapi.testclient import TestClient
+from backend.main import app
 from backend.database import get_db, init_db
 from backend.security import generate_session_id, get_session_expiry
 
@@ -9,6 +8,12 @@ init_db()
 def test_multi_user_isolation():
     conn = get_db()
     cursor = conn.cursor()
+
+    # Pre-clean test rows in case of previous run residue
+    cursor.execute("DELETE FROM user_tasks WHERE id = 'tsk_alice_1'")
+    cursor.execute("DELETE FROM sessions WHERE user_id IN ('usr_user_a', 'usr_user_b')")
+    cursor.execute("DELETE FROM users WHERE id IN ('usr_user_a', 'usr_user_b')")
+    conn.commit()
 
     # Create User A
     cursor.execute("""
@@ -47,7 +52,7 @@ def test_multi_user_isolation():
     headers_a = {"Cookie": f"session_id={session_a}"}
     headers_b = {"Cookie": f"session_id={session_b}"}
 
-    client = httpx.Client(base_url="http://127.0.0.1:8001")
+    client = TestClient(app)
 
     # Alice checks her tasks
     res_a = client.get("/api/user/data", headers=headers_a)

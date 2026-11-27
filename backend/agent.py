@@ -796,8 +796,21 @@ async def execute_policy_gate_and_tools(
     conn = get_db()
     cursor = conn.cursor()
 
-    # Rule 1: Emergency Kill Switch Check
-    if kill_switch_active:
+    # Rule 1: Emergency Kill Switch Check (Authoritative Persistent Storage Check)
+    authoritative_ks = False
+    if user_id:
+        try:
+            cursor.execute("SELECT kill_switch_enabled FROM user_agent_settings WHERE user_id = ?", (user_id,))
+            ks_row = cursor.fetchone()
+            if ks_row:
+                authoritative_ks = bool(ks_row["kill_switch_enabled"] if isinstance(ks_row, dict) else ks_row[0])
+        except Exception:
+            pass
+
+    # The backend persistent saved setting is authoritative.
+    effective_kill_switch = authoritative_ks or kill_switch_active
+
+    if effective_kill_switch:
         result["policy_decision"] = "Refused: Emergency Kill Switch is Engaged"
         result["text"] = f"Action blocked: The supervisor engine is halted by the emergency kill switch. Cannot run tool '{tool_name}'."
         cursor.execute("""
@@ -1231,17 +1244,43 @@ async def execute_policy_gate_and_tools(
 
         if target_id:
             cursor.execute("SELECT * FROM user_calendar_events WHERE id = ? AND user_id = ?", (target_id, user_id))
+            matches = cursor.fetchall()
         else:
-            cursor.execute("SELECT * FROM user_calendar_events WHERE user_id = ? AND lower(title) LIKE ? ORDER BY event_date ASC LIMIT 1", (user_id, f"%{target_title}%"))
+            if not target_title:
+                conn.close()
+                result["tool_executed"] = "update_calendar_event"
+                result["policy_decision"] = "Missing Event Details"
+                result["text"] = "Please specify the event title or event ID to reschedule."
+                return result
+            cursor.execute(
+                "SELECT * FROM user_calendar_events WHERE user_id = ? AND lower(title) LIKE ? ORDER BY event_date ASC, start_time ASC",
+                (user_id, f"%{target_title}%")
+            )
+            matches = cursor.fetchall()
 
-        evt = cursor.fetchone()
-        if not evt:
+        if not matches:
             conn.close()
             result["tool_executed"] = "update_calendar_event"
             result["policy_decision"] = "Event Not Found"
             result["text"] = f"Could not find any calendar event matching '{params.get('title', target_id)}' to reschedule."
             return result
 
+        if len(matches) > 1:
+            conn.close()
+            lines = [
+                f"- {m['title']} on {m['event_date']} ({m['start_time']} - {m['end_time']}) [ID: {m['id']}]"
+                for m in matches
+            ]
+            result["tool_executed"] = "update_calendar_event"
+            result["policy_decision"] = "Refused: Ambiguous Target Event"
+            result["text"] = (
+                f"Multiple calendar events matched '{params.get('title', '')}'. "
+                f"Please specify which event you want to reschedule by providing its exact details or ID:\n"
+                + "\n".join(lines)
+            )
+            return result
+
+        evt = dict(matches[0])
         event_id = evt["id"]
         updated_date = new_date or evt["event_date"]
         updated_start = new_start or evt["start_time"]
@@ -1256,22 +1295,37 @@ async def execute_policy_gate_and_tools(
             result["text"] = f"Cannot reschedule '{evt['title']}': conflict detected with existing '{c['title']}' ({c['start_time']} - {c['end_time']}) on {updated_date}."
             return result
 
+        # Mandatory human approval for calendar modification
+        approval_id = f"appr_cal_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        draft_payload = json.dumps({
+            "action": "update_calendar_event",
+            "event_id": event_id,
+            "title": evt["title"],
+            "event_date": updated_date,
+            "start_time": updated_start,
+            "end_time": updated_end,
+            "original_date": evt["event_date"],
+            "original_start": evt["start_time"],
+            "original_end": evt["end_time"]
+        })
+        now_iso = datetime.now(timezone.utc).isoformat()
         cursor.execute("""
-            UPDATE user_calendar_events
-            SET event_date = ?, start_time = ?, end_time = ?
-            WHERE id = ? AND user_id = ?
-        """, (updated_date, updated_start, updated_end, event_id, user_id))
-
+            INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
+            VALUES (?, ?, 'Calendar Update', ?, ?, 'Calendar event modification requires explicit human approval before execution.', 'Medium', ?, 'pending', ?)
+        """, (approval_id, user_id, evt["title"], f"Reschedule: {evt['title']} to {updated_date} ({updated_start} - {updated_end})", draft_payload, now_iso))
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Reschedule Event: {evt['title']}", latency_ms, f"Moved to {updated_date} ({updated_start} - {updated_end})", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}", user_id, f"Propose Reschedule: {evt['title']}", latency_ms, f"Queued approval {approval_id}", now_iso))
         conn.commit()
         conn.close()
 
         result["tool_executed"] = "update_calendar_event"
-        result["policy_decision"] = "Allowed & Executed"
-        result["text"] = f"Successfully rescheduled calendar event '{evt['title']}' to {updated_date} ({updated_start} - {updated_end})."
+        result["approval_required"] = True
+        result["approval_id"] = approval_id
+        result["policy_decision"] = "Queued: Staged in Human Approval Queue"
+        result["action_details"] = {"approval_id": approval_id, "event_id": event_id, "action": "update_calendar_event"}
+        result["text"] = f"I have queued the request to reschedule '{evt['title']}' to {updated_date} ({updated_start} - {updated_end}) in your Approvals inbox (ID: `{approval_id}`). The event will not be updated until you review and approve this action."
         return result
 
     if tool_name == "delete_calendar_event":
@@ -1280,28 +1334,73 @@ async def execute_policy_gate_and_tools(
 
         if target_id:
             cursor.execute("SELECT * FROM user_calendar_events WHERE id = ? AND user_id = ?", (target_id, user_id))
+            matches = cursor.fetchall()
         else:
-            cursor.execute("SELECT * FROM user_calendar_events WHERE user_id = ? AND lower(title) LIKE ? ORDER BY event_date ASC LIMIT 1", (user_id, f"%{target_title}%"))
+            if not target_title:
+                conn.close()
+                result["tool_executed"] = "delete_calendar_event"
+                result["policy_decision"] = "Missing Event Details"
+                result["text"] = "Please specify the event title or event ID to delete."
+                return result
+            cursor.execute(
+                "SELECT * FROM user_calendar_events WHERE user_id = ? AND lower(title) LIKE ? ORDER BY event_date ASC, start_time ASC",
+                (user_id, f"%{target_title}%")
+            )
+            matches = cursor.fetchall()
 
-        evt = cursor.fetchone()
-        if not evt:
+        if not matches:
             conn.close()
             result["tool_executed"] = "delete_calendar_event"
             result["policy_decision"] = "Event Not Found"
             result["text"] = f"Could not find any calendar event matching '{params.get('title', target_id)}' to delete."
             return result
 
-        cursor.execute("DELETE FROM user_calendar_events WHERE id = ? AND user_id = ?", (evt["id"], user_id))
+        if len(matches) > 1:
+            conn.close()
+            lines = [
+                f"- {m['title']} on {m['event_date']} ({m['start_time']} - {m['end_time']}) [ID: {m['id']}]"
+                for m in matches
+            ]
+            result["tool_executed"] = "delete_calendar_event"
+            result["policy_decision"] = "Refused: Ambiguous Target Event"
+            result["text"] = (
+                f"Multiple calendar events matched '{params.get('title', '')}'. "
+                f"Please specify which event you want to cancel by providing its exact details or ID:\n"
+                + "\n".join(lines)
+            )
+            return result
+
+        evt = dict(matches[0])
+        event_id = evt["id"]
+
+        # Mandatory human approval for calendar deletion
+        approval_id = f"appr_cal_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        draft_payload = json.dumps({
+            "action": "delete_calendar_event",
+            "event_id": event_id,
+            "title": evt["title"],
+            "event_date": evt["event_date"],
+            "start_time": evt["start_time"],
+            "end_time": evt["end_time"]
+        })
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor.execute("""
+            INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
+            VALUES (?, ?, 'Calendar Deletion', ?, ?, 'Calendar event deletion requires explicit human approval before execution.', 'High', ?, 'pending', ?)
+        """, (approval_id, user_id, evt["title"], f"Cancel Event: {evt['title']} on {evt['event_date']}", draft_payload, now_iso))
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Delete Event: {evt['title']}", latency_ms, "Event canceled and removed", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}", user_id, f"Propose Delete: {evt['title']}", latency_ms, f"Queued approval {approval_id}", now_iso))
         conn.commit()
         conn.close()
 
         result["tool_executed"] = "delete_calendar_event"
-        result["policy_decision"] = "Allowed & Executed"
-        result["text"] = f"Successfully canceled and removed calendar event '{evt['title']}' scheduled on {evt['event_date']}."
+        result["approval_required"] = True
+        result["approval_id"] = approval_id
+        result["policy_decision"] = "Queued: Staged in Human Approval Queue"
+        result["action_details"] = {"approval_id": approval_id, "event_id": event_id, "action": "delete_calendar_event"}
+        result["text"] = f"I have queued the cancellation for calendar event '{evt['title']}' scheduled on {evt['event_date']} ({evt['start_time']} - {evt['end_time']}) in your Approvals inbox (ID: `{approval_id}`). The event will not be deleted until you review and approve this action."
         return result
 
     # =========================================================
