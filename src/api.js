@@ -125,11 +125,11 @@ export async function toggleUserTask(taskId) {
   return await res.json()
 }
 
-export async function updateUserTask(taskId, fields) {
+export async function updateUserTask(taskId, updates) {
   const res = await fetch(`/api/user/tasks/${encodeURIComponent(taskId)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(fields)
+    body: JSON.stringify(updates)
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
@@ -269,6 +269,19 @@ export async function createCalendarEvent(eventData) {
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || 'Failed to create calendar event')
+  }
+  return await res.json()
+}
+
+export async function updateCalendarEvent(eventId, eventData) {
+  const res = await fetch(`/api/user/calendar/events/${eventId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(eventData)
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to update calendar event')
   }
   return await res.json()
 }

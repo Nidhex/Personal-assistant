@@ -8,7 +8,9 @@ import {
   ArrowUpDown,
   ChevronRight,
   X,
-  FileText
+  FileText,
+  Edit2,
+  Trash2
 } from 'lucide-react'
 import { createUserTask, toggleUserTask, updateUserTask, deleteUserTask } from '../api'
 
@@ -670,6 +672,89 @@ export default function TasksView({
                   className="rounded-xl bg-[#242424] px-4 py-2 text-xs font-semibold text-[#FFFDF8] hover:bg-[#383838] transition-colors disabled:opacity-30 cursor-pointer shadow-warm-sm"
                 >
                   {submitting ? 'Saving...' : 'Save Task to Database'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Task Modal */}
+      {isEditingTask && selectedTask && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#171717]/40 backdrop-blur-xs p-4">
+          <div className="w-full max-w-lg rounded-2xl border border-[#DEDAD0] bg-[#FFFDF8] p-6 shadow-warm-md space-y-4 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between border-b border-[#DEDAD0] pb-3">
+              <h3 className="text-sm font-semibold text-[#242424]">Edit Task</h3>
+              <button
+                onClick={() => setIsEditingTask(false)}
+                className="text-xs text-[#6B7280] hover:text-[#242424]"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleUpdateTask} className="space-y-4">
+              <div className="space-y-1">
+                <label className="text-xs font-semibold text-[#242424]">Task Title</label>
+                <input
+                  type="text"
+                  required
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  className="w-full rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] p-2.5 text-xs text-[#242424] focus:outline-none focus:border-[#242424]"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-[#242424]">Due Deadline</label>
+                  <input
+                    type="text"
+                    value={editDueDate}
+                    onChange={(e) => setEditDueDate(e.target.value)}
+                    className="w-full rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] p-2.5 text-xs text-[#242424] focus:outline-none focus:border-[#242424]"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-[#242424]">Priority</label>
+                  <select
+                    value={editPriority}
+                    onChange={(e) => setEditPriority(e.target.value)}
+                    className="w-full rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] p-2.5 text-xs text-[#242424] focus:outline-none focus:border-[#242424]"
+                  >
+                    <option value="normal">Normal</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High Priority</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs font-semibold text-[#242424]">Workspace Context</label>
+                <input
+                  type="text"
+                  value={editWorkspace}
+                  onChange={(e) => setEditWorkspace(e.target.value)}
+                  className="w-full rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] p-2.5 text-xs text-[#242424] focus:outline-none focus:border-[#242424]"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#DEDAD0]">
+                <button
+                  type="button"
+                  onClick={() => setIsEditingTask(false)}
+                  className="rounded-xl border border-[#DEDAD0] bg-[#FFFDF8] px-3.5 py-2 text-xs font-medium text-[#6B7280] hover:text-[#242424]"
+                >
+                  Cancel
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={updating || !editTitle.trim()}
+                  className="rounded-xl bg-[#242424] px-4 py-2 text-xs font-semibold text-[#FFFDF8] hover:bg-[#383838] transition-colors disabled:opacity-30 cursor-pointer shadow-warm-sm"
+                >
+                  {updating ? 'Saving...' : 'Save Changes'}
                 </button>
               </div>
             </form>

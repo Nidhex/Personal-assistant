@@ -151,6 +151,14 @@ def log_run_step(
     conn.commit()
     conn.close()
 
+def extract_deadline_from_text(text: str):
+    """Safely extracts deadline indicators from untrusted email text without executing commands."""
+    lower = text.lower()
+    has_deadline = any(k in lower for k in ["deadline", "due", "submit", "assignment", "by tomorrow", "by friday", "meeting at", "urgent"])
+    dt = "Tomorrow" if "tomorrow" in lower else ("Friday" if "friday" in lower else "Upcoming")
+    action = "Task created from email deadline" if has_deadline else None
+    return has_deadline, dt, action
+
 # -------------------------------------------------------------
 # 3. DAILY RUN ORCHESTRATOR
 # -------------------------------------------------------------

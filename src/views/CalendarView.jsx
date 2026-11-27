@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react'
-import { createCalendarEvent } from '../api'
+import { createCalendarEvent, updateCalendarEvent, deleteCalendarEvent } from '../api'
 import {
   Calendar as CalendarIcon,
   Clock,
@@ -505,7 +505,7 @@ export default function CalendarView({
                   </div>
                 )}
 
-                {selectedEvent.isTask && (
+                {selectedEvent.isTask ? (
                   <div className="pt-2">
                     <button
                       onClick={() => setActiveTab('tasks')}
@@ -513,6 +513,28 @@ export default function CalendarView({
                     >
                       <span>Jump to Task in Workspace</span>
                       <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="pt-2 flex items-center gap-2">
+                    <button
+                      onClick={async () => {
+                        if (window.confirm(`Delete calendar event "${selectedEvent.title}"?`)) {
+                          try {
+                            await deleteCalendarEvent(selectedEvent.id)
+                            if (setCalendarEvents) {
+                              setCalendarEvents(prev => prev.filter(e => e.id !== selectedEvent.id))
+                            }
+                            setSelectedEvent(null)
+                            showToast('Calendar event deleted.')
+                          } catch (err) {
+                            showToast(err.message || 'Failed to delete event.')
+                          }
+                        }
+                      }}
+                      className="flex-1 rounded-xl border border-red-200 bg-red-50 py-2 text-xs font-semibold text-red-700 hover:bg-red-100 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                    >
+                      <span>Delete Event</span>
                     </button>
                   </div>
                 )}

@@ -529,6 +529,7 @@ export default function App() {
                 onGmailStatusChange={handleGmailStatusChange}
                 showToast={showToast}
                 onTaskCreated={() => loadRealUserData(gmailConnected)}
+                onMessagesUpdated={(msgs) => setEmails(msgs)}
               />
             )}
 

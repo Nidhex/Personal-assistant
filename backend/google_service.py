@@ -1,4 +1,5 @@
 import os
+import asyncio
 import base64
 import re
 from datetime import datetime, timezone, timedelta
@@ -181,26 +182,53 @@ def _decode_body_part(part) -> str:
     data = part.get("body", {}).get("data", "")
     if data:
         try:
-            # Base64 URL safe decoding
-            decoded_bytes = base64.urlsafe_b64decode(data + "==")
+            # Base64 URL safe decoding with correct padding
+            rem = len(data) % 4
+            if rem > 0:
+                data += "=" * (4 - rem)
+            decoded_bytes = base64.urlsafe_b64decode(data)
             return decoded_bytes.decode("utf-8", errors="replace")
         except Exception:
             return ""
     return ""
 
+def _extract_attachments(payload) -> list:
+    """Recursively extracts attachment metadata without downloading payload files."""
+    attachments = []
+    parts = payload.get("parts", [])
+    for part in parts:
+        filename = part.get("filename", "")
+        if filename:
+            body = part.get("body", {})
+            attachments.append({
+                "filename": filename,
+                "mimeType": part.get("mimeType", "application/octet-stream"),
+                "size": body.get("size", 0),
+                "attachmentId": body.get("attachmentId", "")
+            })
+        if "parts" in part:
+            attachments.extend(_extract_attachments(part))
+    return attachments
+
 def _extract_message_body(payload) -> str:
-    """Traverses multipart MIME tree to extract clean message text."""
+    """Traverses multipart MIME tree to extract clean message text, stripping scripts and styling."""
     mime_type = payload.get("mimeType", "")
     body_data = payload.get("body", {}).get("data", "")
 
     if body_data:
         try:
-            decoded_bytes = base64.urlsafe_b64decode(body_data + "==")
+            rem = len(body_data) % 4
+            if rem > 0:
+                body_data += "=" * (4 - rem)
+            decoded_bytes = base64.urlsafe_b64decode(body_data)
             text = decoded_bytes.decode("utf-8", errors="replace")
-            # If html, strip tags simply for safe display
+            # If html, strip script, style, and tags simply for safe display
             if "html" in mime_type:
+                text = re.sub(r'<script[^>]*>[\s\S]*?</script>', '', text, flags=re.IGNORECASE)
+                text = re.sub(r'<style[^>]*>[\s\S]*?</style>', '', text, flags=re.IGNORECASE)
                 text = re.sub(r'<[^>]+>', ' ', text)
                 text = re.sub(r'\s+', ' ', text).strip()
+                text = re.sub(r'\s+([.,;:!?])', r'\1', text)
             return text
         except Exception:
             pass
@@ -221,11 +249,16 @@ def _extract_message_body(payload) -> str:
                 plain_text += "\n" + sub
 
     if plain_text.strip():
-        return plain_text.strip()
+        clean = re.sub(r'\s+([.,;:!?])', r'\1', plain_text.strip())
+        return clean
     if html_text.strip():
-        # Strip html tags
-        clean = re.sub(r'<[^>]+>', ' ', html_text)
-        return re.sub(r'\s+', ' ', clean).strip()
+        # Strip script, style, and html tags
+        clean = re.sub(r'<script[^>]*>[\s\S]*?</script>', '', html_text, flags=re.IGNORECASE)
+        clean = re.sub(r'<style[^>]*>[\s\S]*?</style>', '', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'<[^>]+>', ' ', clean)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        clean = re.sub(r'\s+([.,;:!?])', r'\1', clean)
+        return clean
 
     return ""
 
@@ -265,20 +298,29 @@ async def fetch_gmail_messages(user_id: str, max_results: int = 15, page_token: 
                 "resultSizeEstimate": list_data.get("resultSizeEstimate", 0)
             }
 
-        # Fetch metadata for each message
+        # Fetch metadata for each message concurrently using asyncio.gather
+        async def _fetch_single_meta(msg_id: str):
+            try:
+                msg_res = await client.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]},
+                    timeout=10.0
+                )
+                if msg_res.status_code == 200:
+                    return msg_res.json()
+            except Exception:
+                pass
+            return None
+
+        raw_meta_results = await asyncio.gather(*[_fetch_single_meta(item["id"]) for item in message_summaries])
+
         messages = []
-        for item in message_summaries:
-            msg_id = item["id"]
-            msg_res = await client.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]},
-                timeout=10.0
-            )
-            if msg_res.status_code != 200:
+        for msg_data in raw_meta_results:
+            if not msg_data:
                 continue
 
-            msg_data = msg_res.json()
+            msg_id = msg_data.get("id")
             headers = {h["name"].lower(): h["value"] for h in msg_data.get("payload", {}).get("headers", [])}
             
             sender_raw = headers.get("from", "Unknown Sender")
@@ -297,6 +339,7 @@ async def fetch_gmail_messages(user_id: str, max_results: int = 15, page_token: 
                 "threadId": msg_data.get("threadId"),
                 "senderName": sender_name or sender_email,
                 "senderEmail": sender_email,
+                "from": sender_raw,
                 "subject": headers.get("subject", "(No Subject)"),
                 "snippet": msg_data.get("snippet", ""),
                 "date": headers.get("date", ""),
@@ -322,6 +365,10 @@ async def fetch_gmail_message_detail(user_id: str, message_id: str):
             timeout=15.0
         )
 
+        if res.status_code == 404:
+            raise Exception("Email message not found or deleted from Gmail.")
+        if res.status_code == 400:
+            raise Exception("Invalid Gmail message identifier.")
         if res.status_code != 200:
             raise Exception(f"Failed to fetch message details: {res.text}")
 
@@ -337,16 +384,20 @@ async def fetch_gmail_message_detail(user_id: str, message_id: str):
             sender_email = sender_raw.split("<")[1].split(">")[0].strip()
 
         body = _extract_message_body(payload)
+        attachments = _extract_attachments(payload)
 
         return {
             "id": message_id,
             "threadId": msg_data.get("threadId"),
             "senderName": sender_name or sender_email,
             "senderEmail": sender_email,
+            "from": sender_raw,
+            "recipient": headers.get("to", ""),
             "subject": headers.get("subject", "(No Subject)"),
             "date": headers.get("date", ""),
             "snippet": msg_data.get("snippet", ""),
             "body": body or msg_data.get("snippet", "(No message body content)"),
+            "attachments": attachments,
             "isUnread": "UNREAD" in msg_data.get("labelIds", []),
             "labels": msg_data.get("labelIds", [])
         }

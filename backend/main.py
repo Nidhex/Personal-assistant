@@ -56,7 +56,12 @@ async def on_startup():
 async def on_shutdown():
     scheduler.stop()
 
-DEV_TEST_MODE = os.getenv("DEV_TEST_MODE", "false").lower() == "true"
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
+IS_PRODUCTION = ENVIRONMENT == "production"
+
+# In production, dev test mode is strictly forbidden regardless of DEV_TEST_MODE value
+DEV_TEST_MODE = False if IS_PRODUCTION else (os.getenv("DEV_TEST_MODE", "false").lower() == "true")
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true" or IS_PRODUCTION
 
 # -------------------------------------------------------------
 # AUTHENTICATION DEPENDENCY
@@ -288,7 +293,7 @@ async def google_callback(
             value=session_id,
             httponly=True,
             samesite="lax",
-            secure=False,  # localhost friendly
+            secure=COOKIE_SECURE,
             max_age=7 * 24 * 3600
         )
         return response
@@ -301,15 +306,20 @@ async def google_callback(
 def logout(request: Request, response: Response):
     """Destroys current session and deletes session cookie."""
     session_id = request.cookies.get("session_id")
+    if not session_id:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            session_id = auth_header.split(" ", 1)[1].strip()
+
     if session_id:
         conn = get_db()
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.commit()
         conn.close()
 
-    response = JSONResponse({"success": True, "message": "Signed out successfully."})
-    response.delete_cookie(key="session_id")
-    return response
+    res = JSONResponse({"success": True, "message": "Signed out successfully."})
+    res.delete_cookie(key="session_id", samesite="lax", httponly=True, secure=COOKIE_SECURE)
+    return res
 
 # -------------------------------------------------------------
 # DEV TEST MODE AUTH (EXPLICITLY GATED)
@@ -350,7 +360,7 @@ def dev_login(req: DevLoginRequest, response: Response):
         value=session_id,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=COOKIE_SECURE,
         max_age=7 * 24 * 3600
     )
     return res
@@ -410,7 +420,12 @@ async def get_message_detail(
         detail = await fetch_gmail_message_detail(user["id"], message_id)
         return detail
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        err_msg = str(e)
+        if "not found" in err_msg.lower():
+            raise HTTPException(status_code=404, detail="Email message not found or deleted from Gmail.")
+        if "invalid" in err_msg.lower():
+            raise HTTPException(status_code=400, detail=err_msg)
+        raise HTTPException(status_code=500, detail=err_msg)
 
 @app.post("/api/gmail/messages/{message_id}/propose-task")
 async def propose_task_from_email(
@@ -562,17 +577,83 @@ class CreateTaskRequest(BaseModel):
     priority: Optional[str] = "normal"
     workspace: Optional[str] = "General"
 
+class UpdateTaskRequest(BaseModel):
+    title: Optional[str] = None
+    source: Optional[str] = None
+    due_date: Optional[str] = None
+    priority: Optional[str] = None
+    workspace: Optional[str] = None
+    completed: Optional[bool] = None
+
 @app.post("/api/user/tasks")
 def create_task(req: CreateTaskRequest, user: dict = Depends(get_current_user)):
+    clean_title = req.title.strip() if req.title else ""
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Task title cannot be empty.")
+
     task_id = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{os.urandom(2).hex()}"
     conn = get_db()
     conn.execute("""
         INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-    """, (task_id, user["id"], req.title, req.source, req.source_email_id, req.due_date, req.priority, req.workspace, datetime.now(timezone.utc).isoformat()))
+    """, (task_id, user["id"], clean_title, req.source, req.source_email_id, req.due_date, req.priority, req.workspace, datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
-    return {"success": True, "id": task_id, "title": req.title}
+    return {"success": True, "id": task_id, "title": clean_title}
+
+@app.put("/api/user/tasks/{task_id}")
+@app.patch("/api/user/tasks/{task_id}")
+def update_task_endpoint(task_id: str, req: UpdateTaskRequest, user: dict = Depends(get_current_user)):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, title, source, due_date, priority, workspace, completed 
+        FROM user_tasks WHERE id = ? AND user_id = ?
+    """, (task_id, user["id"]))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    new_title = req.title.strip() if req.title is not None and req.title.strip() else row["title"]
+    new_source = req.source if req.source is not None else row["source"]
+    new_due = req.due_date if req.due_date is not None else row["due_date"]
+    new_priority = req.priority if req.priority is not None else row["priority"]
+    new_workspace = req.workspace if req.workspace is not None else row["workspace"]
+    new_completed = int(req.completed) if req.completed is not None else row["completed"]
+
+    cursor.execute("""
+        UPDATE user_tasks 
+        SET title = ?, source = ?, due_date = ?, priority = ?, workspace = ?, completed = ?
+        WHERE id = ? AND user_id = ?
+    """, (new_title, new_source, new_due, new_priority, new_workspace, new_completed, task_id, user["id"]))
+    conn.commit()
+    conn.close()
+    return {
+        "success": True,
+        "task": {
+            "id": task_id,
+            "title": new_title,
+            "source": new_source,
+            "due_date": new_due,
+            "priority": new_priority,
+            "workspace": new_workspace,
+            "completed": bool(new_completed)
+        }
+    }
+
+@app.delete("/api/user/tasks/{task_id}")
+def delete_task_endpoint(task_id: str, user: dict = Depends(get_current_user)):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM user_tasks WHERE id = ? AND user_id = ?", (task_id, user["id"]))
+    if not cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found.")
+    cursor.execute("DELETE FROM user_tasks WHERE id = ? AND user_id = ?", (task_id, user["id"]))
+    conn.commit()
+    conn.close()
+    return {"success": True}
 
 @app.post("/api/user/tasks/{task_id}/toggle")
 def toggle_task(task_id: str, user: dict = Depends(get_current_user)):
@@ -1139,6 +1220,15 @@ class CreateCalendarEventRequest(BaseModel):
     workspace_id: Optional[str] = None
     force: Optional[bool] = False
 
+class UpdateCalendarEventRequest(BaseModel):
+    title: Optional[str] = None
+    event_date: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    force: Optional[bool] = False
+
 @app.get("/api/user/calendar/events")
 def get_calendar_events(
     date: Optional[str] = None,
@@ -1167,6 +1257,9 @@ def create_calendar_event(
     req: CreateCalendarEventRequest,
     user: dict = Depends(get_current_user)
 ):
+    if not req.title or not req.title.strip():
+        raise HTTPException(status_code=400, detail="Event title cannot be empty.")
+
     from .agent import detect_calendar_conflicts
     if not req.force:
         conflicts = detect_calendar_conflicts(user["id"], req.event_date, req.start_time, req.end_time)
@@ -1195,6 +1288,62 @@ def create_calendar_event(
             "end_time": req.end_time,
             "category": req.category,
             "description": req.description
+        }
+    }
+
+@app.put("/api/user/calendar/events/{event_id}")
+def update_calendar_event(
+    event_id: str,
+    req: UpdateCalendarEventRequest,
+    user: dict = Depends(get_current_user)
+):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM user_calendar_events WHERE id = ? AND user_id = ?", (event_id, user["id"]))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Event not found.")
+
+    new_title = req.title.strip() if req.title is not None else existing["title"]
+    if not new_title:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Event title cannot be empty.")
+
+    new_date = req.event_date if req.event_date is not None else existing["event_date"]
+    new_start = req.start_time if req.start_time is not None else existing["start_time"]
+    new_end = req.end_time if req.end_time is not None else existing["end_time"]
+    new_category = req.category if req.category is not None else existing["category"]
+    new_desc = req.description if req.description is not None else existing["description"]
+
+    from .agent import detect_calendar_conflicts
+    if not req.force:
+        conflicts = [c for c in detect_calendar_conflicts(user["id"], new_date, new_start, new_end) if c["id"] != event_id]
+        if conflicts:
+            conn.close()
+            raise HTTPException(
+                status_code=409,
+                detail=f"Calendar conflict with existing event '{conflicts[0]['title']}' ({conflicts[0]['start_time']} - {conflicts[0]['end_time']})."
+            )
+
+    cursor.execute("""
+        UPDATE user_calendar_events
+        SET title = ?, event_date = ?, start_time = ?, end_time = ?, category = ?, description = ?
+        WHERE id = ? AND user_id = ?
+    """, (new_title, new_date, new_start, new_end, new_category, new_desc, event_id, user["id"]))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "event": {
+            "id": event_id,
+            "title": new_title,
+            "event_date": new_date,
+            "start_time": new_start,
+            "end_time": new_end,
+            "category": new_category,
+            "description": new_desc
         }
     }
 
