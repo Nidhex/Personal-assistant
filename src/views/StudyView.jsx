@@ -176,7 +176,7 @@ export default function StudyView({
         is_generated: Boolean(data.is_generated),
         noteTitle: data.note?.title || 'Saved to General workspace',
       })
-      setYtStatus('ready')
+      setYtStatus('success')
       showToast('YouTube notes generated and saved.')
     } catch (err) {
       const fallbackCodes = new Set([
@@ -210,6 +210,8 @@ export default function StudyView({
     }
 
     setExtractedYtTopics(topics)
+    setYtMeta(null)
+    setYtFallbackReason('')
     setYtStatus('success')
     showToast(`Parsed ${topics.length} topic sections with timestamps.`)
   }
@@ -407,6 +409,9 @@ export default function StudyView({
                   onChange={(e) => {
                     setYtUrl(e.target.value)
                     if (ytStatus !== 'idle') setYtStatus('idle')
+                    if (extractedYtTopics.length > 0) setExtractedYtTopics([])
+                    if (ytMeta) setYtMeta(null)
+                    if (ytFallbackReason) setYtFallbackReason('')
                   }}
                   placeholder="https://www.youtube.com/watch?v=..."
                   className="w-full rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] pl-9 pr-3 py-2 text-xs text-[#242424] placeholder:text-[#9CA3AF] focus:border-[#242424] focus:bg-[#FFFDF8] focus:outline-none transition-all"
@@ -433,7 +438,7 @@ export default function StudyView({
                     No transcript available. No notes were created.
                   </h4>
                   <p className="text-[#713F12] leading-relaxed">
-                    This video does not have accessible automated captions or a public transcript service integration. The assistant does not generate notes from assumptions or invent content.
+                    {ytFallbackReason || 'Captions are unavailable for this video. Paste the transcript manually below to generate grounded notes.'}
                   </p>
                 </div>
               </div>
@@ -464,10 +469,15 @@ export default function StudyView({
           {/* Success State: Extracted Timestamped Topics */}
           {ytStatus === 'success' && extractedYtTopics.length > 0 && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between border-b border-[#DEDAD0] pb-2 text-xs">
-                <div className="flex items-center gap-2">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#DEDAD0] pb-2 text-xs">
+                <div className="flex items-center gap-2 flex-wrap">
                   <CheckCircle2 className="h-4 w-4 text-[#708A4E]" />
                   <span className="font-semibold text-[#242424]">Extracted Topic Notes & Questions</span>
+                  {ytMeta && (
+                    <span className="rounded bg-[#F7F4EB] border border-[#DEDAD0] px-2 py-0.5 text-[10px] font-mono text-[#54524C]">
+                      {ytMeta.language} • {ytMeta.is_generated ? 'Auto-generated captions' : 'Manual captions'} • Saved: {ytMeta.noteTitle}
+                    </span>
+                  )}
                 </div>
                 <span className="text-[#6B7280] font-mono">
                   {extractedYtTopics.length} Sections
