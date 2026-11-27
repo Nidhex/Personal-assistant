@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 
 from .database import get_db
 from .google_service import fetch_gmail_messages
+from .http_client import http_post
 
 # Complete verified Tool Allowlist
 ALLOWED_TOOLS = [
@@ -399,35 +400,34 @@ Calendar Events:
                 payload = {
                     "contents": [{"parts": [{"text": f"{system_instruction}\n\nUser request: {prompt}"}]}]
                 }
-                async with httpx.AsyncClient(timeout=20.0) as http_client:
-                    r = await http_client.post(url, json=payload)
-                    if r.status_code == 200:
-                        data = r.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            if parts:
-                                return parts[0].get("text", "")
+                r = await http_post(url, json_data=payload, timeout=20.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "")
             except Exception:
                 pass
 
     # If OpenAI API key is configured
     if openai_key:
         try:
-            async with httpx.AsyncClient(timeout=20.0) as http_client:
-                messages = [{"role": "system", "content": system_instruction}]
-                for msg in context.get("conversation_history", []):
-                    messages.append({"role": msg["role"], "content": msg["content"]})
-                messages.append({"role": "user", "content": prompt})
+            messages = [{"role": "system", "content": system_instruction}]
+            for msg in context.get("conversation_history", []):
+                messages.append({"role": msg["role"], "content": msg["content"]})
+            messages.append({"role": "user", "content": prompt})
 
-                res = await http_client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {openai_key}"},
-                    json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.3}
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    return data["choices"][0]["message"]["content"]
+            res = await http_post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {openai_key}"},
+                json_data={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.3},
+                timeout=20.0
+            )
+            if res.status_code == 200:
+                data = res.json()
+                return data["choices"][0]["message"]["content"]
         except Exception:
             pass
 

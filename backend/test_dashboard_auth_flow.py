@@ -100,3 +100,61 @@ def test_agent_settings_get_and_save(setup_test_db):
     assert update_res.status_code == 200
     assert update_res.json()["success"] is True
     assert update_res.json()["settings"]["preferred_time"] == "09:30"
+
+def test_multi_user_isolation(setup_test_db):
+    client = TestClient(app)
+    conn = get_db()
+
+    # User B setup
+    user_b_id = "usr_test_user_b"
+    session_b_id = "test_dash_session_token_user_b"
+    conn.execute("INSERT OR REPLACE INTO users (id, email, name, picture, created_at) VALUES (?, 'user_b@example.com', 'User B', '', '2026-01-01T00:00:00Z')", (user_b_id,))
+    conn.execute("INSERT OR REPLACE INTO sessions (session_id, user_id, expires_at, created_at) VALUES (?, ?, ?, '2026-01-01T00:00:00Z')", (session_b_id, user_b_id, get_session_expiry(days=7)))
+    conn.execute("INSERT INTO user_tasks (id, user_id, title, source, created_at) VALUES ('tsk_b_1', ?, 'Task For User B Only', 'test', '2026-01-01T00:00:00Z')", (user_b_id,))
+    conn.commit()
+    conn.close()
+
+    # User A requests /api/user/data
+    res_a = client.get("/api/user/data", headers={"Authorization": f"Bearer {setup_test_db['session_id']}"})
+    assert res_a.status_code == 200
+    task_titles_a = [t["title"] for t in res_a.json()["tasks"]]
+    assert "Task For User B Only" not in task_titles_a
+
+    # User B requests /api/user/data
+    res_b = client.get("/api/user/data", headers={"Authorization": f"Bearer {session_b_id}"})
+    assert res_b.status_code == 200
+    task_titles_b = [t["title"] for t in res_b.json()["tasks"]]
+    assert "Task For User B Only" in task_titles_b
+
+def test_logout_invalidates_session(setup_test_db):
+    client = TestClient(app)
+    sid = setup_test_db["session_id"]
+
+    # Verify initially authenticated
+    res_before = client.get("/api/auth/me", headers={"Authorization": f"Bearer {sid}"})
+    assert res_before.status_code == 200
+    assert res_before.json()["authenticated"] is True
+
+    # Logout
+    logout_res = client.post("/api/auth/logout", headers={"Authorization": f"Bearer {sid}"})
+    assert logout_res.status_code == 200
+    assert logout_res.json()["success"] is True
+
+    # Verify session is destroyed in DB and /api/auth/me returns unauthenticated
+    res_after = client.get("/api/auth/me", headers={"Authorization": f"Bearer {sid}"})
+    assert res_after.status_code == 200
+    assert res_after.json()["authenticated"] is False
+    assert res_after.json()["user"] is None
+
+def test_expired_session_rejected(setup_test_db):
+    client = TestClient(app)
+    conn = get_db()
+    expired_sid = "test_expired_session_token_999"
+    conn.execute("INSERT OR REPLACE INTO sessions (session_id, user_id, expires_at, created_at) VALUES (?, ?, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')", (expired_sid, setup_test_db["user_id"]))
+    conn.commit()
+    conn.close()
+
+    res = client.get("/api/auth/me", headers={"Authorization": f"Bearer {expired_sid}"})
+    assert res.status_code == 200
+    assert res.json()["authenticated"] is False
+    assert res.json()["user"] is None

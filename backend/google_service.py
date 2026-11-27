@@ -7,8 +7,21 @@ from urllib.parse import urlencode
 import httpx
 from dotenv import load_dotenv
 
+from .http_client import HAS_WORKER_FETCH, http_get, http_post
 from .security import encrypt_token, decrypt_token, is_expired
 from .database import get_db
+
+async def _client_get(url: str, headers: dict = None, params: dict = None, timeout: float = 15.0):
+    if HAS_WORKER_FETCH:
+        return await http_get(url, headers=headers, params=params, timeout=timeout)
+    async with httpx.AsyncClient() as client:
+        return await client.get(url, headers=headers, params=params, timeout=timeout)
+
+async def _client_post(url: str, data: dict = None, headers: dict = None, timeout: float = 15.0):
+    if HAS_WORKER_FETCH:
+        return await http_post(url, data=data, headers=headers, timeout=timeout)
+    async with httpx.AsyncClient() as client:
+        return await client.post(url, data=data, headers=headers, timeout=timeout)
 
 load_dotenv()
 
@@ -147,32 +160,30 @@ async def exchange_code_for_tokens(code: str, request=None):
     redir = get_config_val("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI)
     if is_production(request) and ("localhost" in redir or "127.0.0.1" in redir or not redir):
         redir = "https://deskagent.hacckthon.workers.dev/api/auth/google/callback"
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": cid,
-                "client_secret": csecret,
-                "code": code,
-                "grant_type": "authorization_code",
-                "redirect_uri": redir
-            },
-            timeout=15.0
-        )
-        if response.status_code != 200:
-            raise Exception(f"Google token exchange failed: {response.text}")
-        return response.json()
+    response = await _client_post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": cid,
+            "client_secret": csecret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": redir
+        },
+        timeout=15.0
+    )
+    if response.status_code != 200:
+        raise Exception(f"Google token exchange failed: {response.text}")
+    return response.json()
 
 async def get_google_user_profile(access_token: str):
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10.0
-        )
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch Google profile: {response.text}")
-        return response.json()
+    response = await _client_get(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10.0
+    )
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch Google profile: {response.text}")
+    return response.json()
 
 async def get_valid_access_token(user_id: str) -> str:
     """Retrieves access token for user, refreshing automatically if expired."""
@@ -218,42 +229,41 @@ async def get_valid_access_token(user_id: str) -> str:
 
     cid = get_config_val("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
     csecret = get_config_val("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": cid,
-                "client_secret": csecret,
-                "refresh_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token"
-            },
-            timeout=15.0
-        )
+    res = await _client_post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": cid,
+            "client_secret": csecret,
+            "refresh_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token"
+        },
+        timeout=15.0
+    )
 
-        if res.status_code != 200:
-            # Refresh token was revoked by user or expired
-            conn = get_db()
-            await conn.execute("UPDATE user_tokens SET gmail_connected = 0 WHERE user_id = ?", (user_id,))
-            conn.commit()
-            conn.close()
-            raise Exception(f"Google token refresh failed: {res.text}. Access was likely revoked.")
-
-        data = res.json()
-        new_access_token = data.get("access_token")
-        expires_in = data.get("expires_in", 3600)
-        new_expiry = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
-
+    if res.status_code != 200:
+        # Refresh token was revoked by user or expired
         conn = get_db()
-        await conn.execute("""
-            UPDATE user_tokens 
-            SET access_token_encrypted = ?, token_expiry = ?, updated_at = ?
-            WHERE user_id = ?
-        """, (encrypt_token(new_access_token), new_expiry, datetime.now(timezone.utc).isoformat(), user_id))
+        await conn.execute("UPDATE user_tokens SET gmail_connected = 0 WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
+        raise Exception(f"Google token refresh failed: {res.text}. Access was likely revoked.")
 
-        return new_access_token
+    data = res.json()
+    new_access_token = data.get("access_token")
+    expires_in = data.get("expires_in", 3600)
+    new_expiry = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+
+    conn = get_db()
+    await conn.execute("""
+        UPDATE user_tokens 
+        SET access_token_encrypted = ?, token_expiry = ?, updated_at = ?
+        WHERE user_id = ?
+    """, (encrypt_token(new_access_token), new_expiry, datetime.now(timezone.utc).isoformat(), user_id))
+    conn.commit()
+    conn.close()
+
+    return new_access_token
 
 async def revoke_user_tokens(user_id: str):
     """Revokes access with Google and removes local credentials."""
@@ -269,12 +279,11 @@ async def revoke_user_tokens(user_id: str):
         token_to_revoke = decrypt_token(row["refresh_token_encrypted"]) or decrypt_token(row["access_token_encrypted"])
         if token_to_revoke:
             try:
-                async with httpx.AsyncClient() as client:
-                    await client.post(
-                        f"https://oauth2.googleapis.com/revoke?token={token_to_revoke}",
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        timeout=5.0
-                    )
+                await _client_post(
+                    f"https://oauth2.googleapis.com/revoke?token={token_to_revoke}",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=5.0
+                )
             except Exception:
                 pass  # Revoke silently if already invalid
 
@@ -381,133 +390,131 @@ async def fetch_gmail_messages(user_id: str, max_results: int = 15, page_token: 
     if page_token:
         params["pageToken"] = page_token
 
-    async with httpx.AsyncClient() as client:
-        list_res = await client.get(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params=params,
-            timeout=15.0
-        )
+    list_res = await _client_get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params=params,
+        timeout=15.0
+    )
 
-        if list_res.status_code == 401 or list_res.status_code == 403:
-            # Token revoked or scopes missing
-            raise Exception("Gmail access unauthorized. Token may have been revoked.")
-        if list_res.status_code != 200:
-            raise Exception(f"Failed to fetch messages list from Gmail: {list_res.text}")
+    if list_res.status_code == 401 or list_res.status_code == 403:
+        # Token revoked or scopes missing
+        raise Exception("Gmail access unauthorized. Token may have been revoked.")
+    if list_res.status_code != 200:
+        raise Exception(f"Failed to fetch messages list from Gmail: {list_res.text}")
 
-        list_data = list_res.json()
-        message_summaries = list_data.get("messages", [])
-        next_page_token = list_data.get("nextPageToken", None)
+    list_data = list_res.json()
+    message_summaries = list_data.get("messages", [])
+    next_page_token = list_data.get("nextPageToken", None)
 
-        if not message_summaries:
-            return {
-                "messages": [],
-                "nextPageToken": None,
-                "resultSizeEstimate": list_data.get("resultSizeEstimate", 0)
-            }
-
-        # Fetch metadata for each message concurrently with bounded semaphore to avoid worker subrequest limits
-        sem = asyncio.Semaphore(3)
-        async def _fetch_single_meta(msg_id: str):
-            async with sem:
-                try:
-                    msg_res = await client.get(
-                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
-                        headers={"Authorization": f"Bearer {access_token}"},
-                        params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]},
-                        timeout=10.0
-                    )
-                    if msg_res.status_code == 200:
-                        return msg_res.json()
-                except Exception:
-                    pass
-                return None
-
-        raw_meta_results = await asyncio.gather(*[_fetch_single_meta(item["id"]) for item in message_summaries])
-
-        messages = []
-        for msg_data in raw_meta_results:
-            if not msg_data:
-                continue
-
-            msg_id = msg_data.get("id")
-            headers = {h["name"].lower(): h["value"] for h in msg_data.get("payload", {}).get("headers", [])}
-            
-            sender_raw = headers.get("from", "Unknown Sender")
-            # Parse sender name and email
-            sender_name = sender_raw
-            sender_email = sender_raw
-            if "<" in sender_raw and ">" in sender_raw:
-                sender_name = sender_raw.split("<")[0].strip().strip('"')
-                sender_email = sender_raw.split("<")[1].split(">")[0].strip()
-
-            label_ids = msg_data.get("labelIds", [])
-            is_unread = "UNREAD" in label_ids
-
-            messages.append({
-                "id": msg_id,
-                "threadId": msg_data.get("threadId"),
-                "senderName": sender_name or sender_email,
-                "senderEmail": sender_email,
-                "from": sender_raw,
-                "subject": headers.get("subject", "(No Subject)"),
-                "snippet": msg_data.get("snippet", ""),
-                "date": headers.get("date", ""),
-                "isUnread": is_unread,
-                "labels": label_ids
-            })
-
+    if not message_summaries:
         return {
-            "messages": messages,
-            "nextPageToken": next_page_token,
-            "resultSizeEstimate": list_data.get("resultSizeEstimate", len(messages))
+            "messages": [],
+            "nextPageToken": None,
+            "resultSizeEstimate": list_data.get("resultSizeEstimate", 0)
         }
 
-async def fetch_gmail_message_detail(user_id: str, message_id: str):
-    """Fetches full sanitized Gmail message content."""
-    access_token = await get_valid_access_token(user_id)
+    # Fetch metadata for each message concurrently with bounded semaphore to avoid worker subrequest limits
+    sem = asyncio.Semaphore(3)
+    async def _fetch_single_meta(msg_id: str):
+        async with sem:
+            try:
+                msg_res = await _client_get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]},
+                    timeout=10.0
+                )
+                if msg_res.status_code == 200:
+                    return msg_res.json()
+            except Exception:
+                pass
+            return None
 
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params={"format": "full"},
-            timeout=15.0
-        )
+    raw_meta_results = await asyncio.gather(*[_fetch_single_meta(item["id"]) for item in message_summaries])
 
-        if res.status_code == 404:
-            raise Exception("Email message not found or deleted from Gmail.")
-        if res.status_code == 400:
-            raise Exception("Invalid Gmail message identifier.")
-        if res.status_code != 200:
-            raise Exception(f"Failed to fetch message details: {res.text}")
+    messages = []
+    for msg_data in raw_meta_results:
+        if not msg_data:
+            continue
 
-        msg_data = res.json()
-        payload = msg_data.get("payload", {})
-        headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-
+        msg_id = msg_data.get("id")
+        headers = {h["name"].lower(): h["value"] for h in msg_data.get("payload", {}).get("headers", [])}
+        
         sender_raw = headers.get("from", "Unknown Sender")
+        # Parse sender name and email
         sender_name = sender_raw
         sender_email = sender_raw
         if "<" in sender_raw and ">" in sender_raw:
             sender_name = sender_raw.split("<")[0].strip().strip('"')
             sender_email = sender_raw.split("<")[1].split(">")[0].strip()
 
-        body = _extract_message_body(payload)
-        attachments = _extract_attachments(payload)
+        label_ids = msg_data.get("labelIds", [])
+        is_unread = "UNREAD" in label_ids
 
-        return {
-            "id": message_id,
+        messages.append({
+            "id": msg_id,
             "threadId": msg_data.get("threadId"),
             "senderName": sender_name or sender_email,
             "senderEmail": sender_email,
             "from": sender_raw,
-            "recipient": headers.get("to", ""),
             "subject": headers.get("subject", "(No Subject)"),
-            "date": headers.get("date", ""),
             "snippet": msg_data.get("snippet", ""),
-            "body": body or msg_data.get("snippet", "(No message body content)"),
-            "attachments": attachments,
-            "isUnread": "UNREAD" in msg_data.get("labelIds", []),
-            "labels": msg_data.get("labelIds", [])
-        }
+            "date": headers.get("date", ""),
+            "isUnread": is_unread,
+            "labels": label_ids
+        })
+
+    return {
+        "messages": messages,
+        "nextPageToken": next_page_token,
+        "resultSizeEstimate": list_data.get("resultSizeEstimate", len(messages))
+    }
+
+async def fetch_gmail_message_detail(user_id: str, message_id: str):
+    """Fetches full sanitized Gmail message content."""
+    access_token = await get_valid_access_token(user_id)
+
+    res = await _client_get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"format": "full"},
+        timeout=15.0
+    )
+
+    if res.status_code == 404:
+        raise Exception("Email message not found or deleted from Gmail.")
+    if res.status_code == 400:
+        raise Exception("Invalid Gmail message identifier.")
+    if res.status_code != 200:
+        raise Exception(f"Failed to fetch message details: {res.text}")
+
+    msg_data = res.json()
+    payload = msg_data.get("payload", {})
+    headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+
+    sender_raw = headers.get("from", "Unknown Sender")
+    sender_name = sender_raw
+    sender_email = sender_raw
+    if "<" in sender_raw and ">" in sender_raw:
+        sender_name = sender_raw.split("<")[0].strip().strip('"')
+        sender_email = sender_raw.split("<")[1].split(">")[0].strip()
+
+    body = _extract_message_body(payload)
+    attachments = _extract_attachments(payload)
+
+    return {
+        "id": message_id,
+        "threadId": msg_data.get("threadId"),
+        "senderName": sender_name or sender_email,
+        "senderEmail": sender_email,
+        "from": sender_raw,
+        "recipient": headers.get("to", ""),
+        "subject": headers.get("subject", "(No Subject)"),
+        "date": headers.get("date", ""),
+        "snippet": msg_data.get("snippet", ""),
+        "body": body or msg_data.get("snippet", "(No message body content)"),
+        "attachments": attachments,
+        "isUnread": "UNREAD" in msg_data.get("labelIds", []),
+        "labels": msg_data.get("labelIds", [])
+    }

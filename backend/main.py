@@ -541,6 +541,7 @@ async def google_callback(
         response.set_cookie(
             key="session_id",
             value=session_id,
+            path="/",
             httponly=True,
             samesite=cookie_samesite,
             secure=cookie_secure,
@@ -551,7 +552,8 @@ async def google_callback(
     except Exception as e:
         conn.close()
         from urllib.parse import quote_plus
-        return RedirectResponse(f"{frontend_base}/?auth_error={quote_plus(str(e))}")
+        err_detail = str(e) or repr(e) or type(e).__name__ or "Unknown error"
+        return RedirectResponse(f"{frontend_base}/?auth_error={quote_plus(err_detail)}")
 
 @app.post("/api/auth/logout")
 async def logout(request: Request, response: Response):
@@ -659,7 +661,7 @@ async def get_messages(
         }
     except Exception as e:
         # Check if authorization expired or revoked
-        err_msg = str(e)
+        err_msg = str(e) or repr(e) or type(e).__name__
         if "unauthorized" in err_msg.lower() or "revoked" in err_msg.lower() or "expired" in err_msg.lower():
             return {
                 "connected": False,
