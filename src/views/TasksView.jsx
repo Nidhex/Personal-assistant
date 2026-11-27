@@ -10,7 +10,7 @@ import {
   X,
   FileText
 } from 'lucide-react'
-import { createUserTask, toggleUserTask } from '../api'
+import { createUserTask, toggleUserTask, updateUserTask, deleteUserTask } from '../api'
 
 export default function TasksView({
   tasks = [],
@@ -31,15 +31,78 @@ export default function TasksView({
   const [workspace, setWorkspace] = useState('General')
   const [submitting, setSubmitting] = useState(false)
 
+  // Edit & Delete state in Task Inspector
+  const [isEditing, setIsEditing] = useState(false)
+  const [editTitle, setEditTitle] = useState('')
+  const [editDueDate, setEditDueDate] = useState('')
+  const [editPriority, setEditPriority] = useState('normal')
+  const [savingEdit, setSavingEdit] = useState(false)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
   // Duplicate task check
-  const checkDuplicate = (newTitle, newSource, newDueDate) => {
+  const checkDuplicate = (newTitle, newSource, newDueDate, excludeId = null) => {
     const cleanTitle = newTitle.trim().toLowerCase()
     return tasks.some(t => {
+      if (excludeId && t.id === excludeId) return false
       const existingTitle = (t.title || '').trim().toLowerCase()
       const sameTitle = existingTitle === cleanTitle
       const sameDue = (t.due_date || t.dueDate || '').toLowerCase() === (newDueDate || '').toLowerCase()
       return sameTitle && sameDue
     })
+  }
+
+  const startEditing = () => {
+    if (!selectedTask) return
+    setEditTitle(selectedTask.title || '')
+    setEditDueDate(selectedTask.due_date || selectedTask.dueDate || '')
+    setEditPriority((selectedTask.priority || 'normal').toLowerCase())
+    setConfirmingDelete(false)
+    setIsEditing(true)
+  }
+
+  const handleSaveEdit = async (e) => {
+    e.preventDefault()
+    if (!selectedTask || !editTitle.trim() || savingEdit) return
+    const trimmedTitle = editTitle.trim()
+    const trimmedDue = editDueDate.trim() || 'No due date'
+    if (checkDuplicate(trimmedTitle, selectedTask.source, trimmedDue, selectedTask.id)) {
+      showToast(`Duplicate prevented: A task with title "${trimmedTitle}" and due date "${trimmedDue}" already exists.`)
+      return
+    }
+    setSavingEdit(true)
+    try {
+      const updated = await updateUserTask(selectedTask.id, {
+        title: trimmedTitle,
+        due_date: trimmedDue,
+        priority: editPriority
+      })
+      setSelectedTask(updated)
+      setIsEditing(false)
+      showToast('Task updated.')
+      if (onTasksChanged) onTasksChanged()
+    } catch (err) {
+      showToast(err.message || 'Failed to update task.')
+    } finally {
+      setSavingEdit(false)
+    }
+  }
+
+  const handleConfirmDelete = async () => {
+    if (!selectedTask || deleting) return
+    setDeleting(true)
+    try {
+      await deleteUserTask(selectedTask.id)
+      setSelectedTask(null)
+      setConfirmingDelete(false)
+      setIsEditing(false)
+      showToast('Task deleted.')
+      if (onTasksChanged) onTasksChanged()
+    } catch (err) {
+      showToast(err.message || 'Failed to delete task.')
+    } finally {
+      setDeleting(false)
+    }
   }
 
   const handleCreateTask = async (e) => {
@@ -249,7 +312,11 @@ export default function TasksView({
                 return (
                   <div
                     key={task.id}
-                    onClick={() => setSelectedTask(task)}
+                    onClick={() => {
+                      setSelectedTask(task)
+                      setIsEditing(false)
+                      setConfirmingDelete(false)
+                    }}
                     className={`py-3 flex items-start gap-3 transition-colors cursor-pointer px-2.5 -mx-2.5 rounded-xl ${
                       isSelected
                         ? 'bg-[#F7F4EB] border-l-2 border-l-[#242424]'
@@ -351,6 +418,60 @@ export default function TasksView({
                   </h3>
                 </div>
 
+                {isEditing ? (
+                  <form onSubmit={handleSaveEdit} className="rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] p-3.5 space-y-3 text-[11px]">
+                    <div>
+                      <label className="block text-[#6B7280] mb-1 font-medium">Title</label>
+                      <input
+                        type="text"
+                        value={editTitle}
+                        onChange={(e) => setEditTitle(e.target.value)}
+                        maxLength={200}
+                        className="w-full rounded-lg border border-[#DEDAD0] bg-[#FFFDF8] px-2.5 py-1.5 text-xs text-[#242424] focus:outline-none focus:border-[#242424]"
+                        placeholder="Task title"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[#6B7280] mb-1 font-medium">Due Date</label>
+                      <input
+                        type="text"
+                        value={editDueDate}
+                        onChange={(e) => setEditDueDate(e.target.value)}
+                        className="w-full rounded-lg border border-[#DEDAD0] bg-[#FFFDF8] px-2.5 py-1.5 text-xs text-[#242424] focus:outline-none focus:border-[#242424]"
+                        placeholder="e.g. Today, Tomorrow, Friday"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[#6B7280] mb-1 font-medium">Priority</label>
+                      <select
+                        value={editPriority}
+                        onChange={(e) => setEditPriority(e.target.value)}
+                        className="w-full rounded-lg border border-[#DEDAD0] bg-[#FFFDF8] px-2.5 py-1.5 text-xs text-[#242424] focus:outline-none focus:border-[#242424]"
+                      >
+                        <option value="normal">Normal</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                      </select>
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        type="submit"
+                        disabled={!editTitle.trim() || savingEdit}
+                        className="flex-1 rounded-lg bg-[#242424] py-1.5 text-xs font-semibold text-[#FFFDF8] hover:bg-[#383838] disabled:opacity-50 transition-colors cursor-pointer"
+                      >
+                        {savingEdit ? 'Saving...' : 'Save'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setIsEditing(false)}
+                        disabled={savingEdit}
+                        className="flex-1 rounded-lg border border-[#DEDAD0] bg-[#FFFDF8] py-1.5 text-xs font-semibold text-[#242424] hover:bg-[#EFECE2] transition-colors cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                ) : (
                 <div className="rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] p-3.5 space-y-2 text-[11px]">
                   <div className="flex items-center justify-between">
                     <span className="text-[#6B7280]">Due Deadline:</span>
@@ -380,6 +501,7 @@ export default function TasksView({
                     </span>
                   </div>
                 </div>
+                )}
 
                 {/* Source Navigation Links */}
                 {selectedTask.source_email_id && (
@@ -397,14 +519,55 @@ export default function TasksView({
                   </div>
                 )}
 
-                {/* Status Toggle Action */}
-                <div className="pt-2">
+                {/* Status Toggle & Edit/Delete Actions */}
+                <div className="pt-2 space-y-2">
                   <button
                     onClick={() => handleToggle(selectedTask.id)}
                     className="w-full rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] py-2 text-xs font-semibold text-[#242424] hover:bg-[#EFECE2] transition-colors cursor-pointer"
                   >
                     {selectedTask.completed ? 'Reopen Task' : 'Mark as Completed'}
                   </button>
+
+                  {!isEditing && !confirmingDelete && (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={startEditing}
+                        className="flex-1 rounded-xl border border-[#DEDAD0] bg-[#FFFDF8] py-2 text-xs font-semibold text-[#242424] hover:bg-[#F7F4EB] transition-colors cursor-pointer"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => setConfirmingDelete(true)}
+                        className="flex-1 rounded-xl border border-[#DEDAD0] bg-[#FFFDF8] py-2 text-xs font-semibold text-[#242424] hover:bg-[#F7F4EB] transition-colors cursor-pointer"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  )}
+
+                  {confirmingDelete && (
+                    <div className="rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] p-3 space-y-2">
+                      <p className="text-[11px] font-medium text-[#242424]">
+                        Delete this task? This cannot be undone.
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setConfirmingDelete(false)}
+                          disabled={deleting}
+                          className="flex-1 rounded-lg border border-[#DEDAD0] bg-[#FFFDF8] py-1.5 text-xs font-semibold text-[#242424] hover:bg-[#EFECE2] transition-colors cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleConfirmDelete}
+                          disabled={deleting}
+                          className="flex-1 rounded-lg bg-[#242424] py-1.5 text-xs font-semibold text-[#FFFDF8] hover:bg-[#383838] disabled:opacity-50 transition-colors cursor-pointer"
+                        >
+                          {deleting ? 'Deleting...' : 'Delete'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
