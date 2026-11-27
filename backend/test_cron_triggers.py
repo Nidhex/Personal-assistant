@@ -167,8 +167,8 @@ class TestCloudflareCronTriggers(unittest.TestCase):
             """, (ref_utc.isoformat(),))
             conn.commit()
 
-        # Run scheduled tick
-        tick_result = asyncio.run(run_scheduled_tick(now_utc=ref_utc))
+        # Run scheduled tick with bounded timeout
+        tick_result = asyncio.run(asyncio.wait_for(run_scheduled_tick(now_utc=ref_utc), timeout=10.0))
         self.assertTrue(tick_result["success"])
         self.assertEqual(tick_result["runs_triggered"], 1)
         self.assertEqual(tick_result["triggered_details"][0]["status"], "stopped_by_kill_switch")
@@ -197,8 +197,8 @@ class TestCloudflareCronTriggers(unittest.TestCase):
             """, (ref_utc.isoformat(),))
             conn.commit()
 
-        # Run scheduled tick
-        tick_result = asyncio.run(run_scheduled_tick(now_utc=ref_utc))
+        # Run scheduled tick with bounded timeout
+        tick_result = asyncio.run(asyncio.wait_for(run_scheduled_tick(now_utc=ref_utc), timeout=10.0))
         self.assertTrue(tick_result["success"])
         self.assertEqual(tick_result["runs_triggered"], 1)
         self.assertIn(tick_result["triggered_details"][0]["status"], ["completed", "completed_with_warnings"])
@@ -222,17 +222,43 @@ class TestCloudflareCronTriggers(unittest.TestCase):
             pass
 
         mock_env = MockWorkerEnv()
-        res = asyncio.run(handle_worker_scheduled_tick(env=mock_env))
+        res = asyncio.run(asyncio.wait_for(handle_worker_scheduled_tick(env=mock_env), timeout=10.0))
         self.assertTrue(res["success"])
         self.assertIn("users_checked", res)
 
     def test_08_local_scheduler_background_service_start_stop(self):
-        """Verify local DailyRunScheduler service starts and stops cleanly."""
+        """Verify local DailyRunScheduler service starts and stops cleanly with bounded execution."""
         sched = DailyRunScheduler()
-        sched.start()
-        self.assertTrue(sched._running)
-        sched.stop()
+        try:
+            sched.start(force=True)
+            self.assertTrue(sched._running)
+        finally:
+            sched.stop()
         self.assertFalse(sched._running)
+
+    def test_09_concurrency_lock_released_in_finally_on_error(self):
+        """Verify lock is guaranteed to be released even if execution raises an unexpected exception."""
+        ref_utc = datetime(2026, 11, 27, 14, 30, 0, tzinfo=timezone.utc)
+        with get_db() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO user_agent_settings (
+                    user_id, daily_run_enabled, preferred_time, timezone, permitted_sources,
+                    max_duration_seconds, max_tool_steps, kill_switch_enabled,
+                    next_run_at, last_run_at, last_run_status, updated_at
+                ) VALUES ('cron_test_ny', 1, '09:00', 'America/New_York', '["tasks"]', 120, 10, 0, NULL, NULL, 'never_run', ?)
+            """, (ref_utc.isoformat(),))
+            conn.commit()
+
+        # Mock execute_daily_run to fail catastrophically
+        with patch("backend.scheduler.execute_daily_run", side_effect=RuntimeError("Simulated worker failure")):
+            tick_result = asyncio.run(asyncio.wait_for(run_scheduled_tick(now_utc=ref_utc), timeout=10.0))
+            self.assertFalse(tick_result["success"])
+            self.assertEqual(len(tick_result["errors"]), 1)
+
+        # Verify database lock was released in finally block and status is 'failed', NOT left stuck in 'running'
+        with get_db() as conn:
+            row = conn.execute("SELECT last_run_status FROM user_agent_settings WHERE user_id = 'cron_test_ny'").fetchone()
+            self.assertEqual(row["last_run_status"], "failed", "Lock status should be 'failed', not 'running'")
 
 if __name__ == "__main__":
     unittest.main()

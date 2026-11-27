@@ -198,7 +198,8 @@ async def run_scheduled_tick(env: Optional[Any] = None, now_utc: Optional[dateti
             skipped.append({"user_id": user_id, "reason": "lock_claim_failed_or_concurrent"})
             continue
 
-        # Execute daily run
+        # Execute daily run with guaranteed lock release in finally block
+        lock_released = False
         try:
             run_result = await execute_daily_run(user_id, trigger_type="scheduled")
             status = run_result.get("status", "completed")
@@ -206,17 +207,29 @@ async def run_scheduled_tick(env: Optional[Any] = None, now_utc: Optional[dateti
 
             rel_conn = get_db(worker_env=env)
             release_run_lock(rel_conn, user_id, status=status, next_run_at=next_run)
+            lock_released = True
             if hasattr(rel_conn, "close"):
                 rel_conn.close()
 
             triggered.append({"user_id": user_id, "status": status, "run_id": run_result.get("run_id")})
         except Exception as e:
             logger.error(f"Scheduled run failed for user {user_id}: {e}", exc_info=True)
-            rel_conn = get_db(worker_env=env)
-            release_run_lock(rel_conn, user_id, status="failed")
-            if hasattr(rel_conn, "close"):
-                rel_conn.close()
+            if not lock_released:
+                rel_conn = get_db(worker_env=env)
+                release_run_lock(rel_conn, user_id, status="failed")
+                lock_released = True
+                if hasattr(rel_conn, "close"):
+                    rel_conn.close()
             errors.append({"user_id": user_id, "error": str(e)})
+        finally:
+            if not lock_released:
+                try:
+                    rel_conn = get_db(worker_env=env)
+                    release_run_lock(rel_conn, user_id, status="failed")
+                    if hasattr(rel_conn, "close"):
+                        rel_conn.close()
+                except Exception:
+                    pass
 
     return {
         "success": len(errors) == 0,
@@ -236,8 +249,12 @@ class DailyRunScheduler:
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
-    def start(self):
+    def start(self, force: bool = False):
         if self._running:
+            return
+        import os
+        # Avoid running background ticker during automated test suites unless forced
+        if not force and (os.getenv("PYTEST_CURRENT_TEST") or os.getenv("TESTING") == "1"):
             return
         self._running = True
         try:
@@ -251,6 +268,7 @@ class DailyRunScheduler:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
+        self._task = None
         logger.info("DailyRunScheduler local background service stopped.")
 
     async def _loop(self):
@@ -262,8 +280,11 @@ class DailyRunScheduler:
             except Exception as e:
                 logger.error(f"Scheduler tick error: {e}", exc_info=True)
 
-            # Local tick interval: 30 seconds
-            await asyncio.sleep(30)
+            try:
+                # Local tick interval: 30 seconds
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
 
     async def _check_and_trigger_runs(self):
         await run_scheduled_tick()

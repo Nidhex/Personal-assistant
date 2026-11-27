@@ -63,25 +63,65 @@ async def cloudflare_worker_env_middleware(request: Request, call_next):
         current_worker_env.reset(token)
 
 # CORS configuration - Strict explicit allowlist without wildcards
-ALLOWED_CORS_ORIGINS = [
-    "https://deskagent.hacckthon.workers.dev",
-    "https://deskagent-backend.hacckthon.workers.dev",
-    "https://deskagent.pages.dev",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-_env_fe = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
-if _env_fe and _env_fe not in ALLOWED_CORS_ORIGINS:
-    ALLOWED_CORS_ORIGINS.append(_env_fe)
-_allowed_extra = os.getenv("ALLOWED_ORIGINS", "")
-if _allowed_extra:
-    for o in _allowed_extra.split(","):
-        o = o.strip().rstrip("/")
-        if o and o not in ALLOWED_CORS_ORIGINS:
-            ALLOWED_CORS_ORIGINS.append(o)
+# Centrally managed: only production frontend origin and explicitly configured development origins
+PRODUCTION_FRONTEND_ORIGIN = "https://deskagent.hacckthon.workers.dev"
+
+def build_allowed_cors_origins() -> list:
+    origins = [PRODUCTION_FRONTEND_ORIGIN]
+    env = os.getenv("ENVIRONMENT", "development").lower()
+    # Explicit development origins permitted in non-production
+    if env != "production":
+        for dev_o in ["http://localhost:5173", "http://127.0.0.1:5173"]:
+            if dev_o not in origins:
+                origins.append(dev_o)
+
+    # Configured FRONTEND_URL if explicitly provided (no wildcards allowed)
+    _env_fe = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+    if _env_fe and "*" not in _env_fe and _env_fe not in origins:
+        origins.append(_env_fe)
+
+    # Additional explicit origins from ALLOWED_ORIGINS (no wildcards allowed)
+    _allowed_extra = os.getenv("ALLOWED_ORIGINS", "")
+    if _allowed_extra:
+        for o in _allowed_extra.split(","):
+            clean = o.strip().rstrip("/")
+            if clean and "*" not in clean and clean not in origins:
+                origins.append(clean)
+
+    return origins
+
+ALLOWED_CORS_ORIGINS = build_allowed_cors_origins()
+
+class StrictCORSMiddleware(CORSMiddleware):
+    """
+    Ensures Access-Control-Allow-Credentials and other permissive CORS headers
+    are strictly emitted ONLY for explicitly allowed origins. Untrusted origins
+    receive no permissive CORS headers whatsoever.
+    """
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        origin = headers.get(b"origin")
+        origin_str = origin.decode("latin1") if origin else None
+
+        if origin_str and not self.is_allowed_origin(origin=origin_str):
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start":
+                    message["headers"] = [
+                        (k, v) for k, v in message.get("headers", [])
+                        if not k.lower().startswith(b"access-control-")
+                    ]
+                await send(message)
+            await self.app(scope, receive, send_wrapper)
+            return
+
+        await super().__call__(scope, receive, send)
 
 app.add_middleware(
-    CORSMiddleware,
+    StrictCORSMiddleware,
     allow_origins=ALLOWED_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -92,7 +132,13 @@ app.add_middleware(
 async def on_startup():
     # Only start background ticker loop when running in traditional server mode (uvicorn)
     # In Cloudflare Workers, scheduled tasks are handled by Cron Triggers via scheduled() handler
-    if os.getenv("CF_PAGES") != "1" and os.getenv("WORKER_ENV") != "1":
+    # Never start background ticker during automated test runs
+    if (
+        os.getenv("CF_PAGES") != "1"
+        and os.getenv("WORKER_ENV") != "1"
+        and not os.getenv("PYTEST_CURRENT_TEST")
+        and os.getenv("TESTING") != "1"
+    ):
         scheduler.start()
 
 @app.on_event("shutdown")

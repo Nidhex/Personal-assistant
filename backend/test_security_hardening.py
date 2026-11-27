@@ -631,28 +631,83 @@ def test_cors_configured_development_origin_accepted(client):
 
 
 def test_cors_random_workers_dev_origin_rejected(client):
-    """Random *.workers.dev origin (e.g. attacker.workers.dev) is NOT granted CORS access."""
+    """Random *.workers.dev origin (e.g. attacker.workers.dev) receives no permissive CORS headers."""
     resp = client.get(
         "/api/auth/status",
         headers={"Origin": "https://random-attacker.workers.dev"}
     )
     assert resp.status_code == 200
-    # Must NOT have access-control-allow-origin
     assert resp.headers.get("access-control-allow-origin") is None
+    assert resp.headers.get("access-control-allow-credentials") is None
 
 
 def test_cors_random_pages_dev_origin_rejected(client):
-    """Random *.pages.dev origin (e.g. malicious.pages.dev) is NOT granted CORS access."""
+    """Random *.pages.dev origin receives no permissive CORS headers."""
     resp = client.get(
         "/api/auth/status",
         headers={"Origin": "https://malicious.pages.dev"}
     )
     assert resp.status_code == 200
     assert resp.headers.get("access-control-allow-origin") is None
+    assert resp.headers.get("access-control-allow-credentials") is None
+
+
+def test_cors_backend_worker_origin_rejected(client):
+    """Backend Worker origin is not a frontend origin and receives no permissive CORS headers."""
+    resp = client.get(
+        "/api/auth/status",
+        headers={"Origin": "https://deskagent-backend.hacckthon.workers.dev"}
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") is None
+    assert resp.headers.get("access-control-allow-credentials") is None
+
+
+def test_cors_malicious_subdomain_rejected(client):
+    """Malicious subdomain attempting to impersonate production origin is rejected."""
+    resp = client.get(
+        "/api/auth/status",
+        headers={"Origin": "https://attacker.deskagent.hacckthon.workers.dev"}
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") is None
+
+
+def test_cors_misleading_suffix_rejected(client):
+    """Origin containing production domain as a prefix with misleading suffix is rejected."""
+    resp = client.get(
+        "/api/auth/status",
+        headers={"Origin": "https://deskagent.hacckthon.workers.dev.attacker.com"}
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") is None
+
+
+def test_cors_missing_origin_handled_correctly(client):
+    """Standard request without Origin header succeeds normally without CORS headers."""
+    resp = client.get("/api/auth/status")
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") is None
+
+
+def test_cors_credentials_allowed_only_for_trusted_origins(client):
+    """Access-Control-Allow-Credentials is true for trusted origins and omitted for untrusted."""
+    resp_trusted = client.get(
+        "/api/auth/status",
+        headers={"Origin": "https://deskagent.hacckthon.workers.dev"}
+    )
+    assert resp_trusted.headers.get("access-control-allow-credentials") == "true"
+
+    resp_untrusted = client.get(
+        "/api/auth/status",
+        headers={"Origin": "https://untrusted-site.com"}
+    )
+    assert resp_untrusted.headers.get("access-control-allow-credentials") is None
+    assert resp_untrusted.headers.get("access-control-allow-origin") is None
 
 
 def test_cors_options_preflight_handling(client):
-    """OPTIONS preflight for trusted origin returns allowed methods and headers."""
+    """OPTIONS preflight for trusted origin returns allowed methods, headers and credentials."""
     resp = client.options(
         "/api/user/data",
         headers={
@@ -666,7 +721,7 @@ def test_cors_options_preflight_handling(client):
     assert resp.headers.get("access-control-allow-credentials") == "true"
     assert "POST" in resp.headers.get("access-control-allow-methods", "")
 
-    # Untrusted preflight
+    # Untrusted preflight receives no permissive CORS headers
     resp_untrusted = client.options(
         "/api/user/data",
         headers={
