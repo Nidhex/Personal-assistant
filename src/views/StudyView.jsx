@@ -17,7 +17,7 @@ import {
   ArrowRight,
   ShieldAlert
 } from 'lucide-react'
-import { createUserTask } from '../api'
+import { createUserTask, fetchYouTubeNotes } from '../api'
 
 // Helper to validate YouTube URLs
 function isValidYouTubeUrl(url) {
@@ -146,11 +146,13 @@ export default function StudyView({
   const [revisionPlan, setRevisionPlan] = useState([])
   const [revealedExamAnswers, setRevealedExamAnswers] = useState({})
   const [addingPlanToTasks, setAddingPlanToTasks] = useState(false)
+  const [ytMeta, setYtMeta] = useState(null)
+  const [ytFallbackReason, setYtFallbackReason] = useState('')
 
   // -------------------------------------------------------------
   // PART A HANDLERS (YOUTUBE)
   // -------------------------------------------------------------
-  const handleCheckVideo = (e) => {
+  const handleCheckVideo = async (e) => {
     e.preventDefault()
     if (!ytUrl.trim()) {
       showToast('Please enter a YouTube video URL.')
@@ -163,15 +165,35 @@ export default function StudyView({
     }
 
     setYtStatus('checking')
+    setYtMeta(null)
+    setYtFallbackReason('')
 
-    // Per mandatory requirement: Check transcript availability.
-    // The backend does not have an automated YouTube transcript proxy configured,
-    // so automated scraping without API cannot be assumed or fabricated.
-    setTimeout(() => {
-      // Set mandatory required state: "No transcript available. No notes were created."
-      setYtStatus('no_transcript')
-      showToast('No automated transcript available for this video.')
-    }, 600)
+    try {
+      const data = await fetchYouTubeNotes(ytUrl.trim())
+      setExtractedYtTopics(data.topics || [])
+      setYtMeta({
+        language: data.language || data.language_code || 'English',
+        is_generated: Boolean(data.is_generated),
+        noteTitle: data.note?.title || 'Saved to General workspace',
+      })
+      setYtStatus('success')
+      showToast('YouTube notes generated and saved.')
+    } catch (err) {
+      const fallbackCodes = new Set([
+        'NO_TRANSCRIPT',
+        'VIDEO_UNAVAILABLE',
+        'TRANSCRIPT_TOO_LARGE',
+        'CAPTION_SERVICE_UNAVAILABLE',
+      ])
+      if (fallbackCodes.has(err.code)) {
+        setYtFallbackReason(err.message)
+        setYtStatus('no_transcript')
+        showToast(err.message)
+      } else {
+        setYtStatus('idle')
+        showToast(err.message || 'Invalid YouTube URL or request failed.')
+      }
+    }
   }
 
   const handleProcessManualTranscript = (e) => {
@@ -188,6 +210,8 @@ export default function StudyView({
     }
 
     setExtractedYtTopics(topics)
+    setYtMeta(null)
+    setYtFallbackReason('')
     setYtStatus('success')
     showToast(`Parsed ${topics.length} topic sections with timestamps.`)
   }
@@ -385,6 +409,9 @@ export default function StudyView({
                   onChange={(e) => {
                     setYtUrl(e.target.value)
                     if (ytStatus !== 'idle') setYtStatus('idle')
+                    if (extractedYtTopics.length > 0) setExtractedYtTopics([])
+                    if (ytMeta) setYtMeta(null)
+                    if (ytFallbackReason) setYtFallbackReason('')
                   }}
                   placeholder="https://www.youtube.com/watch?v=..."
                   className="w-full rounded-xl border border-[#DEDAD0] bg-[#F7F4EB] pl-9 pr-3 py-2 text-xs text-[#242424] placeholder:text-[#9CA3AF] focus:border-[#242424] focus:bg-[#FFFDF8] focus:outline-none transition-all"
@@ -411,7 +438,7 @@ export default function StudyView({
                     No transcript available. No notes were created.
                   </h4>
                   <p className="text-[#713F12] leading-relaxed">
-                    This video does not have accessible automated captions or a public transcript service integration. The assistant does not generate notes from assumptions or invent content.
+                    {ytFallbackReason || 'Captions are unavailable for this video. Paste the transcript manually below to generate grounded notes.'}
                   </p>
                 </div>
               </div>
@@ -442,10 +469,15 @@ export default function StudyView({
           {/* Success State: Extracted Timestamped Topics */}
           {ytStatus === 'success' && extractedYtTopics.length > 0 && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between border-b border-[#DEDAD0] pb-2 text-xs">
-                <div className="flex items-center gap-2">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#DEDAD0] pb-2 text-xs">
+                <div className="flex items-center gap-2 flex-wrap">
                   <CheckCircle2 className="h-4 w-4 text-[#708A4E]" />
                   <span className="font-semibold text-[#242424]">Extracted Topic Notes & Questions</span>
+                  {ytMeta && (
+                    <span className="rounded bg-[#F7F4EB] border border-[#DEDAD0] px-2 py-0.5 text-[10px] font-mono text-[#54524C]">
+                      {ytMeta.language} • {ytMeta.is_generated ? 'Auto-generated captions' : 'Manual captions'} • Saved: {ytMeta.noteTitle}
+                    </span>
+                  )}
                 </div>
                 <span className="text-[#6B7280] font-mono">
                   {extractedYtTopics.length} Sections

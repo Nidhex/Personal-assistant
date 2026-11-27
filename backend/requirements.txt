@@ -3,5 +3,6 @@ uvicorn
 httpx
 pydantic
 python-dotenv
+youtube-transcript-api==1.2.5
 # Optional for live Gemini model path:
 # google-genai

@@ -149,6 +149,22 @@ export async function deleteUserTask(taskId) {
   return await res.json()
 }
 
+export async function fetchYouTubeNotes(url) {
+  const res = await fetch('/api/youtube/notes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url })
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const err = new Error(data.detail || 'Failed to retrieve YouTube captions')
+    err.code = data.code || 'YOUTUBE_NOTES_FAILED'
+    err.status = res.status
+    throw err
+  }
+  return data
+}
+
 export async function createUserWorkspace(ws) {
   const res = await fetch('/api/user/workspaces', {
     method: 'POST',
