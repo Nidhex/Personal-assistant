@@ -107,6 +107,18 @@ export async function createUserTask(task) {
   return await res.json()
 }
 
+export async function proposeTaskFromEmail(messageId) {
+  const res = await fetch(`/api/gmail/messages/${encodeURIComponent(messageId)}/propose-task`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to propose task from email')
+  }
+  return await res.json()
+}
+
 export async function toggleUserTask(taskId) {
   const res = await fetch(`/api/user/tasks/${taskId}/toggle`, { method: 'POST' })
   if (!res.ok) throw new Error('Failed to update task')

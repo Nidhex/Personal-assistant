@@ -15,7 +15,7 @@ import {
   fetchGmailMessages,
   fetchGmailMessageDetail,
   disconnectGmail,
-  createUserTask,
+  proposeTaskFromEmail,
   getGoogleAuthUrl
 } from '../api'
 
@@ -132,18 +132,12 @@ export default function InboxView({
   const handleExtractTask = async () => {
     if (!selectedMessageDetail) return
     try {
-      await createUserTask({
-        title: `Follow up: ${selectedMessageDetail.subject || 'Email Action'}`,
-        source: `Email: ${selectedMessageDetail.senderName || selectedMessageDetail.from}`,
-        source_email_id: selectedMessageDetail.id,
-        due_date: 'Inbox review',
-        priority: 'normal',
-        workspace: 'General'
-      })
-      showToast('Task created and linked to this email.')
+      await proposeTaskFromEmail(selectedMessageDetail.id)
+      showToast('Task proposal sent to Approvals.')
+      window.dispatchEvent(new CustomEvent('pa:data-changed'))
       if (onTaskCreated) onTaskCreated()
-    } catch {
-      showToast('Failed to create task.')
+    } catch (err) {
+      showToast(err.message || 'Failed to propose task.')
     }
   }
 
