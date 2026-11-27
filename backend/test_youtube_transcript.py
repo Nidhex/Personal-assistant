@@ -103,12 +103,21 @@ def test_generated_and_manual_captions_save_and_dedupe():
         assert len(d1["topics"]) == 2
         assert d1["topics"][0]["timestamp"] == "00:00"
         assert d1["topics"][1]["timestamp"] == "05:10"
+        for topic in d1["topics"]:
+            assert isinstance(topic.get("questions"), list) and len(topic["questions"]) >= 1
+            assert isinstance(topic["questions"][0].get("q"), str) and topic["questions"][0]["q"].strip()
+            assert isinstance(topic["questions"][0].get("a"), str) and topic["questions"][0]["a"].strip()
         note_id = d1["note"]["id"]
 
         # Duplicate processing returns existing note without calling YouTube again
         res2 = client.post("/api/youtube/notes", json={"url": "https://youtu.be/dQw4w9WgXcQ"})
         assert res2.status_code == 200
-        assert res2.json()["note"]["id"] == note_id
+        d2 = res2.json()
+        assert d2["note"]["id"] == note_id
+        for topic in d2["topics"]:
+            assert isinstance(topic.get("questions"), list) and len(topic["questions"]) >= 1
+            assert isinstance(topic["questions"][0].get("q"), str) and topic["questions"][0]["q"].strip()
+            assert isinstance(topic["questions"][0].get("a"), str) and topic["questions"][0]["a"].strip()
         assert mock_api.return_value.list.call_count == 1
 
     # Manual captions

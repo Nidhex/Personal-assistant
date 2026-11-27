@@ -211,8 +211,7 @@ def build_timestamp_sections(snippets: List[Dict[str, Any]]) -> List[Dict[str, A
             "title": title,
             "summary": summary,
             "keyPoints": key_points,
-            "question": question,
-            "answer": answer,
+            "questions": [{"q": question, "a": answer}],
         })
 
     return topics
