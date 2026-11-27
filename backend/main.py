@@ -1104,6 +1104,37 @@ class YouTubeNotesRequest(BaseModel):
 
 _yt_rate_limits: dict[str, list[float]] = {}
 
+def _resolve_general_workspace_id(conn, user_id: str) -> str:
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM user_workspaces WHERE user_id = ? AND lower(name) = 'general' ORDER BY created_at ASC LIMIT 1",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["id"]
+    ws_id = f"ws_general_{user_id}"
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO user_workspaces (id, user_id, name, type, description, created_at)
+        VALUES (?, ?, 'General', 'General', 'Default general workspace.', ?)
+        """,
+        (ws_id, user_id, datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    return ws_id
+
+def _normalize_youtube_topics(topics: list) -> list:
+    normalized = []
+    for t in topics or []:
+        if not isinstance(t, dict):
+            continue
+        item = dict(t)
+        if not item.get("questions") and (item.get("question") or item.get("answer")):
+            item["questions"] = [{"q": item.get("question", ""), "a": item.get("answer", "")}]
+        normalized.append(item)
+    return normalized
+
 @app.post("/api/youtube/notes")
 async def create_youtube_notes(
     req: YouTubeNotesRequest,
@@ -1124,12 +1155,13 @@ async def create_youtube_notes(
     except YouTubeServiceError as e:
         return JSONResponse(status_code=e.status_code, content={"code": e.code, "detail": e.message})
 
-    # Check for existing saved note for this user & video_id in General workspace before calling YouTube
+    # Resolve user's General workspace & check for existing saved note before calling YouTube
     conn = get_db()
+    general_ws_id = _resolve_general_workspace_id(conn, user["id"])
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, title, content FROM user_workspace_notes WHERE user_id = ? AND workspace_id = 'General' ORDER BY created_at DESC",
-        (user["id"],)
+        "SELECT id, title, content FROM user_workspace_notes WHERE user_id = ? AND workspace_id = ? ORDER BY created_at DESC",
+        (user["id"], general_ws_id)
     )
     for row in cursor.fetchall():
         try:
@@ -1144,7 +1176,7 @@ async def create_youtube_notes(
                 "language_code": saved.get("language_code", "en"),
                 "language": saved.get("language", "English"),
                 "is_generated": bool(saved.get("is_generated", False)),
-                "topics": saved.get("topics", []),
+                "topics": _normalize_youtube_topics(saved.get("topics", [])),
                 "note": {"id": row["id"], "title": row["title"]},
             }
     conn.close()
@@ -1190,10 +1222,11 @@ async def create_youtube_notes(
     }
 
     conn = get_db()
+    general_ws_id = _resolve_general_workspace_id(conn, user["id"])
     conn.execute("""
         INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at)
-        VALUES (?, 'General', ?, ?, ?, ?, ?)
-    """, (note_id, user["id"], note_title, json.dumps(note_payload), now_str, now_str))
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (note_id, general_ws_id, user["id"], note_title, json.dumps(note_payload), now_str, now_str))
     conn.commit()
     conn.close()
 

@@ -133,7 +133,63 @@ def test_generated_and_manual_captions_save_and_dedupe():
 
     # User isolation: uid2 has its own note, not uid1's
     assert res3.json()["note"]["id"] != note_id
+
+    # Verify General workspace was created once per user and foreign_keys=ON is active
+    conn = get_db()
+    fk_val = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    assert fk_val == 1
+    ws_u1 = conn.execute("SELECT id FROM user_workspaces WHERE user_id = ? AND lower(name) = 'general'", (uid,)).fetchall()
+    ws_u2 = conn.execute("SELECT id FROM user_workspaces WHERE user_id = ? AND lower(name) = 'general'", (uid2,)).fetchall()
+    conn.close()
+    assert len(ws_u1) == 1
+    assert len(ws_u2) == 1
+    assert ws_u1[0]["id"] != ws_u2[0]["id"]
     print("PASS: test_generated_and_manual_captions_save_and_dedupe")
+
+
+def test_legacy_question_normalization():
+    init_db()
+    uid = "test_yt_legacy_user"
+    _setup_user(uid, "ytlegacy@example.com")
+    client = _client_for(uid)
+
+    conn = get_db()
+    ws_id = f"ws_general_{uid}"
+    conn.execute(
+        "INSERT OR IGNORE INTO user_workspaces (id, user_id, name, type, description, created_at) VALUES (?, ?, 'General', 'General', 'Default', datetime('now'))",
+        (ws_id, uid),
+    )
+    legacy_payload = {
+        "video_url": "https://www.youtube.com/watch?v=9bZkp7q19f0",
+        "video_id": "9bZkp7q19f0",
+        "language_code": "en",
+        "language": "English",
+        "is_generated": False,
+        "topics": [
+            {
+                "id": "yt_sec_1",
+                "timestamp": "00:00",
+                "title": "Legacy Topic",
+                "summary": "Legacy summary",
+                "keyPoints": ["Point 1"],
+                "question": "Legacy Q?",
+                "answer": "Legacy A.",
+            }
+        ],
+    }
+    conn.execute(
+        "INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at) VALUES ('not_legacy_1', ?, ?, 'Legacy Note', ?, datetime('now'), datetime('now'))",
+        (ws_id, uid, json.dumps(legacy_payload)),
+    )
+    conn.commit()
+    conn.close()
+
+    res = client.post("/api/youtube/notes", json={"url": "https://www.youtube.com/watch?v=9bZkp7q19f0"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["note"]["id"] == "not_legacy_1"
+    assert data["topics"][0]["questions"] == [{"q": "Legacy Q?", "a": "Legacy A."}]
+    print("PASS: test_legacy_question_normalization")
 
 
 def test_error_mappings():
@@ -172,5 +228,6 @@ def test_error_mappings():
 if __name__ == "__main__":
     test_url_validation()
     test_generated_and_manual_captions_save_and_dedupe()
+    test_legacy_question_normalization()
     test_error_mappings()
     print("\nALL YOUTUBE TRANSCRIPT TESTS PASSED!")
