@@ -316,16 +316,6 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
     now_utc = datetime.now(timezone.utc)
     now_str = now_utc.isoformat()
 
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO agent_runs (
-            id, user_id, trigger_type, status, started_at, total_steps,
-            actions_completed, actions_refused, actions_failed, summary
-        ) VALUES (?, ?, ?, 'running', ?, 0, 0, 0, 0, 'Run in progress')
-    """, (run_id, user_id, trigger_type, now_str))
-    conn.commit()
-    conn.close()
-
     step_num = 1
     actions_completed = 0
     actions_refused = 0
@@ -336,6 +326,20 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
     important_emails = []
 
     try:
+        import sqlite3
+        conn = get_db()
+        if isinstance(conn, sqlite3.Connection):
+            conn.execute("PRAGMA busy_timeout = 1500")
+        try:
+            conn.execute("""
+                INSERT INTO agent_runs (
+                    id, user_id, trigger_type, status, started_at, total_steps,
+                    actions_completed, actions_refused, actions_failed, summary
+                ) VALUES (?, ?, ?, 'running', ?, 0, 0, 0, 0, 'Run in progress')
+            """, (run_id, user_id, trigger_type, now_str))
+            conn.commit()
+        finally:
+            conn.close()
         # Step 1: Load configuration & permissions
         settings = get_or_create_user_settings(user_id)
         permitted_sources = settings.get("permitted_sources", ["gmail", "tasks", "calendar"])

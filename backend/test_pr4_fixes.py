@@ -330,10 +330,41 @@ def test_log_run_step_same_millisecond_no_collision(monkeypatch):
     init_db()
     uid = "test_orch_same_ms"
     _setup_user(uid, "orchms@example.com")
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_runs (id, user_id, trigger_type, status, started_at) VALUES ('run_ms_1', ?, 'manual', 'running', datetime('now'))",
+        (uid,),
+    )
+    conn.commit()
+    conn.close()
 
     monkeypatch.setattr(time_mod, "time", lambda: 1700000000.123)
-    log_run_step("run_ms_1", uid, 1, "Step One", None, None, "Allowed", False, "completed", "ok1", "1ms")
-    log_run_step("run_ms_1", uid, 2, "Step Two", None, None, "Allowed", False, "completed", "ok2", "1ms")
+    log_run_step(
+        run_id="run_ms_1",
+        user_id=uid,
+        step_number=1,
+        step_name="Step One",
+        tool_name=None,
+        policy_decision="Allowed",
+        status="completed",
+        result="ok1",
+        tool_parameters=None,
+        approval_required=False,
+        latency_ms="1ms",
+    )
+    log_run_step(
+        run_id="run_ms_1",
+        user_id=uid,
+        step_number=2,
+        step_name="Step Two",
+        tool_name=None,
+        policy_decision="Allowed",
+        status="completed",
+        result="ok2",
+        tool_parameters=None,
+        approval_required=False,
+        latency_ms="1ms",
+    )
 
     conn = get_db()
     rows = conn.execute("SELECT * FROM user_activity WHERE user_id = ?", (uid,)).fetchall()
