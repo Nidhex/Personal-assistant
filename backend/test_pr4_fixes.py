@@ -321,3 +321,63 @@ def test_concurrent_email_draft_approve_only_creates_once():
     conn.close()
     assert row["status"] == "approved"
     assert row["gmail_draft_id"] == "draft_concurrent_1"
+
+
+def test_log_run_step_same_millisecond_no_collision(monkeypatch):
+    import time as time_mod
+    from backend.orchestrator import log_run_step
+
+    init_db()
+    uid = "test_orch_same_ms"
+    _setup_user(uid, "orchms@example.com")
+
+    monkeypatch.setattr(time_mod, "time", lambda: 1700000000.123)
+    log_run_step("run_ms_1", uid, 1, "Step One", None, None, "Allowed", False, "completed", "ok1", "1ms")
+    log_run_step("run_ms_1", uid, 2, "Step Two", None, None, "Allowed", False, "completed", "ok2", "1ms")
+
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM user_activity WHERE user_id = ?", (uid,)).fetchall()
+    conn.close()
+    assert len(rows) == 2
+
+
+def test_log_run_step_insert_failure_logs_warning_and_does_not_raise(caplog):
+    import logging
+    from backend.orchestrator import log_run_step
+
+    bad_conn = MagicMock()
+    bad_conn.execute.side_effect = RuntimeError("disk full")
+    with caplog.at_level(logging.WARNING):
+        with patch("backend.orchestrator.get_db", return_value=bad_conn):
+            log_run_step("run_fail_1", "u_fail", 1, "Step Fail", None, None, "Allowed", False, "failed", "err", "0ms")
+    assert any("log_run_step failed" in rec.message for rec in caplog.records)
+    assert bad_conn.rollback.called
+    assert bad_conn.close.called
+
+
+def test_execute_daily_run_lock_held_bounded_time(caplog):
+    import asyncio
+    import logging
+    import sqlite3
+    import time as time_mod
+    import backend.database as db_mod
+    from backend.orchestrator import execute_daily_run
+
+    init_db()
+    uid = "test_orch_lock"
+    _setup_user(uid, "orchlock@example.com")
+
+    lock_conn = sqlite3.connect(str(db_mod.DB_PATH), timeout=1.0)
+    lock_conn.execute("BEGIN IMMEDIATE")
+    t0 = time_mod.monotonic()
+    try:
+        with caplog.at_level(logging.WARNING):
+            res = asyncio.run(execute_daily_run(uid, trigger_type="manual"))
+    finally:
+        lock_conn.rollback()
+        lock_conn.close()
+    elapsed = time_mod.monotonic() - t0
+
+    assert res["success"] is False
+    assert elapsed < 8.0
+    assert any("Failed to record run failure" in rec.message for rec in caplog.records)
