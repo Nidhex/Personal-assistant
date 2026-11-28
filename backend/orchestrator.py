@@ -238,25 +238,46 @@ def log_run_step(
     now_str = datetime.now(timezone.utc).isoformat()
     params_str = json.dumps(tool_parameters) if tool_parameters else None
 
+    import logging
+    import sqlite3
+    import uuid
+    logger = logging.getLogger(__name__)
+
     conn = get_db()
-    conn.execute("""
-        INSERT INTO agent_run_steps (
-            id, run_id, user_id, step_number, step_name, tool_name,
-            tool_parameters, policy_decision, approval_required, status, result, latency_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        step_id, run_id, user_id, step_number, step_name, tool_name,
-        params_str, policy_decision, int(approval_required), status, result, latency_ms, now_str
-    ))
+    if isinstance(conn, sqlite3.Connection):
+        conn.execute("PRAGMA busy_timeout = 1500")
+    try:
+        conn.execute("""
+            INSERT INTO agent_run_steps (
+                id, run_id, user_id, step_number, step_name, tool_name,
+                tool_parameters, policy_decision, approval_required, status, result, latency_ms, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            step_id, run_id, user_id, step_number, step_name, tool_name,
+            params_str, policy_decision, int(approval_required), status, result, latency_ms, now_str
+        ))
 
-    # Also log into user_activity for unified trace visibility
-    conn.execute("""
-        INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (f"act_{int(time.time()*1000)}", user_id, f"Agent Step {step_number}: {step_name}", status.capitalize(), latency_ms, result[:200], now_str))
+        # Also log into user_activity for unified trace visibility
+        conn.execute("""
+            INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Agent Step {step_number}: {step_name}", status.capitalize(), latency_ms, result[:200], now_str))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "log_run_step failed (run_id=%s, user_id=%s, step=%s): %s",
+            run_id, user_id, step_number, exc,
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def extract_deadline_from_text(text: str):
     """Safely extracts deadline indicators from untrusted email text without executing commands."""
@@ -295,16 +316,6 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
     now_utc = datetime.now(timezone.utc)
     now_str = now_utc.isoformat()
 
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO agent_runs (
-            id, user_id, trigger_type, status, started_at, total_steps,
-            actions_completed, actions_refused, actions_failed, summary
-        ) VALUES (?, ?, ?, 'running', ?, 0, 0, 0, 0, 'Run in progress')
-    """, (run_id, user_id, trigger_type, now_str))
-    conn.commit()
-    conn.close()
-
     step_num = 1
     actions_completed = 0
     actions_refused = 0
@@ -315,6 +326,20 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
     important_emails = []
 
     try:
+        import sqlite3
+        conn = get_db()
+        if isinstance(conn, sqlite3.Connection):
+            conn.execute("PRAGMA busy_timeout = 1500")
+        try:
+            conn.execute("""
+                INSERT INTO agent_runs (
+                    id, user_id, trigger_type, status, started_at, total_steps,
+                    actions_completed, actions_refused, actions_failed, summary
+                ) VALUES (?, ?, ?, 'running', ?, 0, 0, 0, 0, 'Run in progress')
+            """, (run_id, user_id, trigger_type, now_str))
+            conn.commit()
+        finally:
+            conn.close()
         # Step 1: Load configuration & permissions
         settings = get_or_create_user_settings(user_id)
         permitted_sources = settings.get("permitted_sources", ["gmail", "tasks", "calendar"])
@@ -605,19 +630,38 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
         }
 
     except Exception as e:
+        import logging
+        import sqlite3
+        logger = logging.getLogger(__name__)
         actions_failed += 1
         err_msg = str(e)
         conn = get_db()
-        conn.execute("""
-            UPDATE agent_runs
-            SET status = 'failed', completed_at = ?, total_steps = ?,
-                actions_failed = ?, error_message = ?
-            WHERE id = ?
-        """, (datetime.now(timezone.utc).isoformat(), step_num, actions_failed, err_msg, run_id))
-        conn.execute("UPDATE user_agent_settings SET last_run_at = ?, last_run_status = 'failed' WHERE user_id = ?",
-                     (datetime.now(timezone.utc).isoformat(), user_id))
-        conn.commit()
-        conn.close()
+        if isinstance(conn, sqlite3.Connection):
+            conn.execute("PRAGMA busy_timeout = 1500")
+        try:
+            conn.execute("""
+                UPDATE agent_runs
+                SET status = 'failed', completed_at = ?, total_steps = ?,
+                    actions_failed = ?, error_message = ?
+                WHERE id = ?
+            """, (datetime.now(timezone.utc).isoformat(), step_num, actions_failed, err_msg, run_id))
+            conn.execute("UPDATE user_agent_settings SET last_run_at = ?, last_run_status = 'failed' WHERE user_id = ?",
+                         (datetime.now(timezone.utc).isoformat(), user_id))
+            conn.commit()
+        except Exception as rec_exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "Failed to record run failure (run_id=%s, original_error=%s): %s",
+                run_id, err_msg, rec_exc,
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
         return {
             "success": False,

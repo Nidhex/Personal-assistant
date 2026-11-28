@@ -644,3 +644,13 @@ pip install google-genai
 ```
 
 Set `GEMINI_API_KEY` in your environment. Without both `google-genai` and `GEMINI_API_KEY`, workspace note retrieval falls back to keyword matching only.
+
+
+## Running tests
+
+Install dev/test dependencies (including `pytest-asyncio` for `asyncio_mode=auto` and `pytest-timeout`):
+
+```bash
+pip install -r backend/requirements.txt -r requirements-dev.txt
+python -m pytest --timeout=30
+```
