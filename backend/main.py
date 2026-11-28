@@ -1329,11 +1329,42 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
         return {"success": True, "status": "approved"}
 
     # Already processed / concurrent duplicate / idempotent retry:
+    if req.action == "approve" and approval_type == "Email Draft" and row["gmail_draft_id"] == "creating":
+        import uuid
+        from .google_service import reconcile_gmail_draft
+        reconciled_id = await reconcile_gmail_draft(user["id"], approval_id, row["draft_content"] or "")
+        if reconciled_id:
+            cursor.execute(
+                "UPDATE user_approvals SET gmail_draft_id = ? WHERE id = ? AND user_id = ?",
+                (reconciled_id, approval_id, user["id"])
+            )
+            cursor.execute("""
+                INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
+            """, (
+                f"act_{uuid.uuid4().hex}",
+                user["id"],
+                f"Approval: {approval_id}",
+                f"Approval completed: Gmail draft reconciled ({reconciled_id})",
+                now_iso
+            ))
+            conn.commit()
+            conn.close()
+            return {"success": True, "status": "approved", "gmail_draft_id": reconciled_id}
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Gmail draft outcome is still uncertain; please check your Gmail drafts before retrying."
+        )
+
     # Do NOT execute action again; return existing status
-    cursor.execute("SELECT status FROM user_approvals WHERE id = ? AND user_id = ?", (approval_id, user["id"]))
+    cursor.execute("SELECT status, gmail_draft_id FROM user_approvals WHERE id = ? AND user_id = ?", (approval_id, user["id"]))
     current = cursor.fetchone()
     conn.close()
-    return {"success": True, "status": current["status"] if current else curr_status}
+    resp_data = {"success": True, "status": current["status"] if current else curr_status}
+    if current and current["gmail_draft_id"] and current["gmail_draft_id"] != "creating":
+        resp_data["gmail_draft_id"] = current["gmail_draft_id"]
+    return resp_data
 
 # -------------------------------------------------------------
 # CHAT & CONVERSATION ENDPOINTS (USER & WORKSPACE ISOLATED)
@@ -1472,7 +1503,7 @@ async def send_chat_message(
     conn.commit()
 
     # Build authorized scoped context
-    context = build_context(user["id"], workspace_id=workspace_id, conversation_id=conversation_id)
+    context = build_context(user["id"], workspace_id=workspace_id, conversation_id=conversation_id, query=req.content)
 
     # Run Planner
     raw_planner_output = await query_llm_planner(req.content.strip(), context)
@@ -1577,6 +1608,16 @@ def get_workspace_notes(
     conn.close()
     return {"notes": notes}
 
+def _safe_note_embedding(title: str, content: str) -> Optional[str]:
+    try:
+        from .agent import generate_embedding
+        emb = generate_embedding(f"{title} {content}".strip())
+        if emb:
+            return json.dumps(emb)
+    except Exception as e:
+        print(f"Skipping note embedding generation: {e}")
+    return None
+
 @app.post("/api/user/workspaces/{workspace_id}/notes")
 def add_workspace_note(
     workspace_id: str,
@@ -1589,12 +1630,15 @@ def add_workspace_note(
 
     note_id = f"not_{int(time.time()*1000)}_{os.urandom(2).hex()}"
     now_str = datetime.now(timezone.utc).isoformat()
+    clean_title = req.title.strip()
+    clean_content = req.content.strip()
+    emb_json = _safe_note_embedding(clean_title, clean_content)
 
     conn = get_db()
     conn.execute("""
-        INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (note_id, workspace_id, user["id"], req.title.trim() if hasattr(req.title, 'trim') else req.title.strip(), req.content.strip(), now_str, now_str))
+        INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, embedding, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (note_id, workspace_id, user["id"], clean_title, clean_content, emb_json, now_str, now_str))
     conn.commit()
     conn.close()
 
@@ -1733,10 +1777,12 @@ async def create_youtube_notes(
 
     conn = get_db()
     general_ws_id = _resolve_general_workspace_id(conn, user["id"])
+    note_content_str = json.dumps(note_payload)
+    emb_json = _safe_note_embedding(note_title, note_content_str)
     conn.execute("""
-        INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (note_id, general_ws_id, user["id"], note_title, json.dumps(note_payload), now_str, now_str))
+        INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, embedding, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (note_id, general_ws_id, user["id"], note_title, note_content_str, emb_json, now_str, now_str))
     conn.commit()
     conn.close()
 
@@ -2186,9 +2232,12 @@ def import_workspace(req: ImportWorkspaceRequest, user: dict = Depends(get_curre
         (ws_id, user["id"], ws_name, ws_type, ws_desc, now_iso),
     )
     for n in req.notes:
+        n_title = n.get("title", "Note")
+        n_content = n.get("content", "")
+        n_emb = _safe_note_embedding(n_title, n_content)
         conn.execute(
-            "INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (f"not_{uuid.uuid4().hex[:12]}", ws_id, user["id"], n.get("title", "Note"), n.get("content", ""), now_iso, now_iso),
+            "INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, embedding, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"not_{uuid.uuid4().hex[:12]}", ws_id, user["id"], n_title, n_content, n_emb, now_iso, now_iso),
         )
     for t in req.tasks:
         conn.execute(

@@ -308,7 +308,8 @@ def retrieve_relevant_notes(user_id: str, workspace_id: Optional[str], query: st
 def build_context(
     user_id: str,
     workspace_id: Optional[str] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    query: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Constructs authorized, scoped context for the assistant:
@@ -353,8 +354,12 @@ def build_context(
             context["workspace"] = dict(ws_row)
 
             # Workspace notes (isolated to this workspace and user)
-            cursor.execute("SELECT id, title, content FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 10", (workspace_id, user_id))
-            context["notes"] = [dict(r) for r in cursor.fetchall()]
+            if query and query.strip():
+                relevant = retrieve_relevant_notes(user_id, workspace_id, query, top_k=5)
+                context["notes"] = [{"id": n["id"], "title": n["title"], "content": n["content"]} for n in relevant]
+            else:
+                cursor.execute("SELECT id, title, content FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 10", (workspace_id, user_id))
+                context["notes"] = [dict(r) for r in cursor.fetchall()]
 
             # Workspace tasks (isolated to this workspace and user)
             cursor.execute("SELECT id, title, due_date, priority, completed FROM user_tasks WHERE (workspace = ? OR workspace = ?) AND user_id = ? ORDER BY created_at DESC LIMIT 15", (ws_row["name"], ws_row["id"], user_id))

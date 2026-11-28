@@ -122,3 +122,95 @@ def test_semantic_search_fallback_and_planning():
         assert plan_res.status_code == 200
         assert len(plan_res.json()["milestones"]) >= 3
         assert "Finish OS Lab" in plan_res.json()["milestones"][0]["title"]
+
+
+def test_reconcile_gmail_draft_on_retry_and_marker_discipline():
+    init_db()
+    uid = "test_pr4_rec_user"
+    _setup_user(uid, "pr4rec@example.com")
+    client = _client_for(uid)
+
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, gmail_draft_id, created_at)
+        VALUES ('appr_rec_1', ?, 'Email Draft', 'a@b.com', 'Subj', 'Reason', 'Medium', 'Body', 'approved', 'creating', datetime('now'))
+        """,
+        (uid,),
+    )
+    conn.commit()
+    conn.close()
+
+    # 1. Ambiguity stays unknown when reconcile returns None -> 409, no new draft created
+    with patch("backend.google_service.reconcile_gmail_draft", new=AsyncMock(return_value=None)):
+        r_409 = client.post("/api/user/approvals/appr_rec_1/action", json={"action": "approve"})
+    assert r_409.status_code == 409
+
+    # 2. Reconciliation adopts matched draft ID -> 200 and stores gmail_draft_id
+    with patch("backend.google_service.reconcile_gmail_draft", new=AsyncMock(return_value="draft_adopted_99")):
+        r_ok = client.post("/api/user/approvals/appr_rec_1/action", json={"action": "approve"})
+    assert r_ok.status_code == 200
+    assert r_ok.json()["gmail_draft_id"] == "draft_adopted_99"
+
+    # 3. Subsequent retry is idempotent (does not re-create)
+    r_idem = client.post("/api/user/approvals/appr_rec_1/action", json={"action": "approve"})
+    assert r_idem.status_code == 200
+    assert r_idem.json()["gmail_draft_id"] == "draft_adopted_99"
+
+
+def test_embeddings_stored_on_insert_and_chat_retrieval():
+    init_db()
+    uid = "test_pr4_emb_user"
+    _setup_user(uid, "pr4emb@example.com")
+    client = _client_for(uid)
+
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO user_workspaces (id, user_id, name, type, description, created_at) VALUES ('ws_emb_1', ?, 'Study', 'General', 'Desc', datetime('now'))",
+        (uid,),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch("backend.agent.generate_embedding", return_value=[0.1, 0.2, 0.3]):
+        res = client.post(
+            "/api/user/workspaces/ws_emb_1/notes",
+            json={"title": "OS Paging", "content": "Virtual memory page tables"},
+        )
+    assert res.status_code == 200, res.text
+
+    conn = get_db()
+    row = conn.execute("SELECT embedding FROM user_workspace_notes WHERE user_id = ? AND workspace_id = 'ws_emb_1'", (uid,)).fetchone()
+    conn.close()
+    assert row is not None and json.loads(row["embedding"]) == [0.1, 0.2, 0.3]
+
+    # Chat path calls build_context -> retrieve_relevant_notes
+    from backend.agent import build_context
+    ctx = build_context(uid, workspace_id="ws_emb_1", query="page tables")
+    assert len(ctx["notes"]) == 1
+    assert ctx["notes"][0]["title"] == "OS Paging"
+
+
+def test_mocked_gemini_planning():
+    init_db()
+    uid = "test_pr4_plan_user"
+    _setup_user(uid, "pr4plan@example.com")
+    client = _client_for(uid)
+
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps([
+        {"id": "m1", "title": "Step 1", "due_date": "2026-12-01", "status": "in_progress"},
+        {"id": "m2", "title": "Step 2", "due_date": "2026-12-03", "status": "pending"},
+        {"id": "m3", "title": "Step 3", "due_date": "2026-12-05", "status": "pending"},
+    ])
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value = mock_resp
+
+    fake_genai = MagicMock()
+    fake_genai.Client.return_value = mock_client
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "fake_key"}):
+        with patch.dict(sys.modules, {"google.genai": fake_genai}):
+            res = client.post("/api/planning/generate", json={"goal": "Launch App", "target_date": "2026-12-05"})
+    assert res.status_code == 200
+    assert len(res.json()["milestones"]) == 3
+    assert res.json()["milestones"][0]["title"] == "Step 1"
