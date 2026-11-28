@@ -519,6 +519,11 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
         conn.close()
 
         # Step 7: Construct Structured Daily Digest
+        cutoff_12h = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+        needs_your_approval = [
+            a for a in pending_approvals
+            if (a.get("created_at") or "") <= cutoff_12h
+        ]
         digest_data = {
             "digest_date": today_str,
             "run_id": run_id,
@@ -539,6 +544,7 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
                 "app_calendar_events": len(all_cal_events)
             },
             "pending_approvals": pending_approvals,
+            "needs_your_approval": needs_your_approval,
             "agent_activity": {
                 "actions_completed": actions_completed,
                 "actions_refused": actions_refused,

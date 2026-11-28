@@ -130,7 +130,8 @@ GOOGLE_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/gmail.readonly"
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
 ]
 
 def is_google_configured() -> bool:
@@ -518,3 +519,32 @@ async def fetch_gmail_message_detail(user_id: str, message_id: str):
         "isUnread": "UNREAD" in msg_data.get("labelIds", []),
         "labels": msg_data.get("labelIds", [])
     }
+
+
+async def create_gmail_draft(user_id: str, to: str, subject: str, body: str) -> str:
+    """Creates a Gmail draft via users.drafts.create. Never sends email."""
+    import base64
+    from email.message import EmailMessage
+
+    access_token = await get_valid_access_token(user_id)
+    if not access_token:
+        raise Exception("Google account not connected or token expired. Please re-authorize Google OAuth.")
+
+    msg = EmailMessage()
+    msg["To"] = to or ""
+    msg["Subject"] = subject or "Draft"
+    msg.set_content(body or "")
+    raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"message": {"raw": raw_b64}},
+        )
+    if resp.status_code == 403:
+        raise Exception("Gmail compose permission missing. Please re-authorize Google OAuth to grant gmail.compose.")
+    if resp.status_code >= 400:
+        raise Exception(f"Gmail draft creation failed ({resp.status_code}).")
+    data = resp.json()
+    return data.get("id", "")

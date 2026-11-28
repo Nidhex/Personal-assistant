@@ -120,7 +120,7 @@ class QAPhase13IntegrationTestSuite(unittest.TestCase):
         # Add sample task and event for Alice
         now_str = datetime.now(timezone.utc).isoformat()
         self.cursor.execute("""
-            INSERT INTO user_tasks (id, user_id, title, due_date, priority, completed, workspace, created_at)
+            INSERT OR REPLACE INTO user_tasks (id, user_id, title, due_date, priority, completed, workspace, created_at)
             VALUES ('tsk_alice_1', ?, 'Finalize Presentation', 'Tomorrow', 'high', 0, 'main', ?)
         """, (self.user_a, now_str))
         self.cursor.execute("""

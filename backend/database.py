@@ -738,7 +738,41 @@ def init_db(conn: Optional[Any] = None, adapter: Optional[str] = None, **kwargs)
     """)
 
     if hasattr(conn, "commit"):
-        conn.commit()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS workspace_shares (
+            token TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    for col, col_type in [
+        ("gmail_draft_id", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE user_approvals ADD COLUMN {col} {col_type}")
+        except Exception:
+            pass
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS workspace_shares (
+            token TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    for col, col_type in [
+        ("embedding", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE user_workspace_notes ADD COLUMN {col} {col_type}")
+        except Exception:
+            pass
+
+    conn.commit()
 
     if owns_conn and hasattr(conn, "close"):
         conn.close()

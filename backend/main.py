@@ -1082,13 +1082,13 @@ class ApprovalActionRequest(BaseModel):
     action: str  # 'approve' or 'reject'
 
 @app.post("/api/user/approvals/{approval_id}/action")
-def handle_approval_action(approval_id: str, req: ApprovalActionRequest, user: dict = Depends(get_current_user)):
+async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, user: dict = Depends(get_current_user)):
     conn = get_db()
     cursor = conn.cursor()
 
     # Verify approval exists and belongs to the authenticated user (strict user isolation & anti-probing 404)
     cursor.execute(
-        "SELECT id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at FROM user_approvals WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, type, target, subject, reason, risk_level, draft_content, status, gmail_draft_id, created_at FROM user_approvals WHERE id = ? AND user_id = ?",
         (approval_id, user["id"])
     )
     row = cursor.fetchone()
@@ -1171,6 +1171,41 @@ def handle_approval_action(approval_id: str, req: ApprovalActionRequest, user: d
             conn.commit()
             conn.close()
             return {"success": True, "status": "approved", "created_task_id": task_id}
+
+        # 1.5 Email Draft -> Create Gmail draft (idempotent, never sends)
+        if approval_type == "Email Draft":
+            import uuid
+            from .google_service import create_gmail_draft
+            draft_id = row["gmail_draft_id"]
+            if not draft_id:
+                try:
+                    draft_id = await create_gmail_draft(
+                        user["id"],
+                        row["target"] or "",
+                        row["subject"] or "Draft",
+                        row["draft_content"] or "",
+                    )
+                except Exception as e:
+                    conn.rollback()
+                    conn.close()
+                    raise HTTPException(status_code=400, detail=str(e))
+                cursor.execute(
+                    "UPDATE user_approvals SET gmail_draft_id = ? WHERE id = ? AND user_id = ?",
+                    (draft_id, approval_id, user["id"])
+                )
+            cursor.execute("""
+                INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
+            """, (
+                f"act_{uuid.uuid4().hex}",
+                user["id"],
+                f"Approval: {approval_id}",
+                f"Approval completed: Gmail draft created ({draft_id})",
+                now_iso
+            ))
+            conn.commit()
+            conn.close()
+            return {"success": True, "status": "approved", "gmail_draft_id": draft_id}
 
         # 2. Calendar Deletion
         if approval_type in ["Calendar Deletion", "delete_calendar_event"]:
@@ -2017,15 +2052,17 @@ def get_latest_daily_digest(user: dict = Depends(get_current_user)):
         FROM daily_digests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
     """, (user["id"],))
     row = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM user_approvals WHERE user_id = ? AND status = 'pending'", (user["id"],))
+    pending_count = cursor.fetchone()[0]
     conn.close()
     if not row:
-        return {"digest": None}
+        return {"digest": None, "pending_approvals": pending_count}
     d = dict(row)
     try:
         d["content"] = json.loads(d["content_json"])
     except Exception:
         d["content"] = {}
-    return {"digest": d}
+    return {"digest": d, "pending_approvals": pending_count}
 
 @app.get("/api/agent/digests")
 def get_daily_digests(user: dict = Depends(get_current_user)):
@@ -2048,3 +2085,170 @@ def get_daily_digests(user: dict = Depends(get_current_user)):
         digests.append(d)
     return {"digests": digests}
 
+
+
+# -------------------------------------------------------------
+# SPACED REPETITION, WORKSPACE EXPORT/IMPORT/SHARE & PLANNING
+# -------------------------------------------------------------
+class SpacedRepetitionRequest(BaseModel):
+    topic: str
+    questions: list = []
+
+@app.post("/api/study/spaced-repetition")
+def schedule_spaced_repetition(req: SpacedRepetitionRequest, user: dict = Depends(get_current_user)):
+    """Creates +1, +3, and +7 day revision tasks for generated exam questions."""
+    import uuid
+    topic = (req.topic or "Study Topic").strip()
+    now = datetime.now(timezone.utc)
+    conn = get_db()
+    created_ids = []
+    for days in (1, 3, 7):
+        due = (now + timedelta(days=days)).strftime("%Y-%m-%d")
+        tid = f"tsk_sr_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
+            VALUES (?, ?, ?, 'Spaced Repetition', NULL, ?, 'normal', 0, 'General', ?)
+            """,
+            (tid, user["id"], f"Review ({days}d): {topic}", due, now.isoformat()),
+        )
+        created_ids.append(tid)
+    conn.commit()
+    conn.close()
+    return {"success": True, "created_task_ids": created_ids}
+
+
+class QuestionResultRequest(BaseModel):
+    topic: str
+    result: str  # 'correct' or 'wrong'
+
+@app.post("/api/study/question-result")
+def record_question_result(req: QuestionResultRequest, user: dict = Depends(get_current_user)):
+    """Re-queues wrongly answered topics into the next revision session."""
+    import uuid
+    if req.result not in ("correct", "wrong"):
+        raise HTTPException(status_code=400, detail="Result must be 'correct' or 'wrong'.")
+    requeued_id = None
+    if req.result == "wrong":
+        now = datetime.now(timezone.utc)
+        due = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        requeued_id = f"tsk_sr_{uuid.uuid4().hex[:12]}"
+        conn = get_db()
+        conn.execute(
+            """
+            INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
+            VALUES (?, ?, ?, 'Spaced Repetition', NULL, ?, 'high', 0, 'General', ?)
+            """,
+            (requeued_id, user["id"], f"Re-review: {req.topic.strip()}", due, now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    return {"success": True, "result": req.result, "requeued_task_id": requeuled_id}
+
+
+@app.get("/api/user/workspaces/{workspace_id}/export")
+def export_workspace(workspace_id: str, user: dict = Depends(get_current_user)):
+    conn = get_db()
+    ws = conn.execute("SELECT id, name, type, description FROM user_workspaces WHERE id = ? AND user_id = ?", (workspace_id, user["id"])).fetchone()
+    if not ws:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    notes = [dict(r) for r in conn.execute("SELECT title, content, created_at FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ?", (workspace_id, user["id"])).fetchall()]
+    tasks = [dict(r) for r in conn.execute("SELECT title, due_date, priority, completed FROM user_tasks WHERE workspace = ? AND user_id = ?", (ws["name"], user["id"])).fetchall()]
+    conn.close()
+    return {"workspace": dict(ws), "notes": notes, "tasks": tasks}
+
+
+class ImportWorkspaceRequest(BaseModel):
+    workspace: dict
+    notes: list = []
+    tasks: list = []
+
+@app.post("/api/user/workspaces/import")
+def import_workspace(req: ImportWorkspaceRequest, user: dict = Depends(get_current_user)):
+    import uuid
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ws_id = f"ws_{uuid.uuid4().hex[:12]}"
+    ws_name = (req.workspace.get("name") or "Imported Workspace").strip()
+    ws_type = (req.workspace.get("type") or "General").strip()
+    ws_desc = (req.workspace.get("description") or "Imported workspace").strip()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO user_workspaces (id, user_id, name, type, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (ws_id, user["id"], ws_name, ws_type, ws_desc, now_iso),
+    )
+    for n in req.notes:
+        conn.execute(
+            "INSERT INTO user_workspace_notes (id, workspace_id, user_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (f"not_{uuid.uuid4().hex[:12]}", ws_id, user["id"], n.get("title", "Note"), n.get("content", ""), now_iso, now_iso),
+        )
+    for t in req.tasks:
+        conn.execute(
+            "INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at) VALUES (?, ?, ?, 'Imported', NULL, ?, ?, ?, ?, ?)",
+            (f"tsk_{uuid.uuid4().hex[:12]}", user["id"], t.get("title", "Task"), t.get("due_date", "Today"), t.get("priority", "normal"), 1 if t.get("completed") else 0, ws_name, now_iso),
+        )
+    conn.commit()
+    conn.close()
+    return {"success": True, "workspace_id": ws_id, "name": ws_name}
+
+
+@app.post("/api/user/workspaces/{workspace_id}/share")
+def create_workspace_share(workspace_id: str, user: dict = Depends(get_current_user)):
+    import secrets
+    conn = get_db()
+    ws = conn.execute("SELECT id FROM user_workspaces WHERE id = ? AND user_id = ?", (workspace_id, user["id"])).fetchone()
+    if not ws:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    token = secrets.token_urlsafe(24)
+    conn.execute(
+        "INSERT INTO workspace_shares (token, workspace_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+        (token, workspace_id, user["id"], datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return {"success": True, "token": token}
+
+
+@app.delete("/api/user/workspaces/{workspace_id}/share")
+def revoke_workspace_share(workspace_id: str, user: dict = Depends(get_current_user)):
+    conn = get_db()
+    conn.execute("DELETE FROM workspace_shares WHERE workspace_id = ? AND user_id = ?", (workspace_id, user["id"]))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+
+@app.get("/api/shared/workspaces/{token}")
+def get_shared_workspace(token: str):
+    conn = get_db()
+    share = conn.execute("SELECT workspace_id, user_id FROM workspace_shares WHERE token = ?", (token,)).fetchone()
+    if not share:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Share link not found or revoked.")
+    ws = conn.execute("SELECT id, name, type, description FROM user_workspaces WHERE id = ? AND user_id = ?", (share["workspace_id"], share["user_id"])).fetchone()
+    if not ws:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    notes = [dict(r) for r in conn.execute("SELECT id, title, content, created_at FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ?", (share["workspace_id"], share["user_id"])).fetchall()]
+    tasks = [dict(r) for r in conn.execute("SELECT id, title, due_date, priority, completed FROM user_tasks WHERE workspace = ? AND user_id = ?", (ws["name"], share["user_id"])).fetchall()]
+    conn.close()
+    return {"read_only": True, "workspace": dict(ws), "notes": notes, "tasks": tasks}
+
+
+class PlanningGenerateRequest(BaseModel):
+    goal: str
+    target_date: Optional[str] = None
+
+@app.post("/api/planning/generate")
+def generate_planning_milestones(req: PlanningGenerateRequest, user: dict = Depends(get_current_user)):
+    goal = (req.goal or "").strip()
+    if not goal:
+        raise HTTPException(status_code=400, detail="Goal is required.")
+    target = (req.target_date or "Next Week").strip()
+    milestones = [
+        {"id": "ms_1", "title": f"Define scope & milestones for: {goal}", "due_date": "Today", "status": "in_progress"},
+        {"id": "ms_2", "title": f"Execute core deliverables for: {goal}", "due_date": target, "status": "pending"},
+        {"id": "ms_3", "title": f"Review & finalize: {goal}", "due_date": target, "status": "pending"},
+    ]
+    return {"success": True, "goal": goal, "target_date": target, "milestones": milestones}

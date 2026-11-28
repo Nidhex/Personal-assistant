@@ -233,7 +233,8 @@ def test_regression_chat_create_task_and_email_draft():
     assert d_res["approval_required"] is True
     draft_appr_id = d_res["approval_id"]
 
-    appr_res = client.post(f"/api/user/approvals/{draft_appr_id}/action", json={"action": "approve"})
+    with patch("backend.google_service.create_gmail_draft", new=AsyncMock(return_value="draft_test_1")):
+        appr_res = client.post(f"/api/user/approvals/{draft_appr_id}/action", json={"action": "approve"})
     assert appr_res.status_code == 200
     assert appr_res.json()["status"] == "approved"
 
