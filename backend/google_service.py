@@ -521,7 +521,7 @@ async def fetch_gmail_message_detail(user_id: str, message_id: str):
     }
 
 
-async def create_gmail_draft(user_id: str, to: str, subject: str, body: str) -> str:
+async def create_gmail_draft(user_id: str, to: str, subject: str, body: str, approval_id: str = "") -> str:
     """Creates a Gmail draft via users.drafts.create. Never sends email."""
     import base64
     from email.message import EmailMessage
@@ -533,6 +533,8 @@ async def create_gmail_draft(user_id: str, to: str, subject: str, body: str) -> 
     msg = EmailMessage()
     msg["To"] = to or ""
     msg["Subject"] = subject or "Draft"
+    if approval_id:
+        msg["X-Assistant-Approval-Id"] = approval_id
     msg.set_content(body or "")
     raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
@@ -547,4 +549,38 @@ async def create_gmail_draft(user_id: str, to: str, subject: str, body: str) -> 
     if resp.status_code >= 400:
         raise Exception(f"Gmail draft creation failed ({resp.status_code}).")
     data = resp.json()
-    return data.get("id", "")
+    draft_id = (data.get("id") or "").strip()
+    if not draft_id:
+        raise RuntimeError("UNCERTAIN_DRAFT_OUTCOME: Gmail draft API returned no draft ID.")
+    return draft_id
+
+
+async def reconcile_gmail_draft(user_id: str, approval_id: str, expected_body: str = "") -> str | None:
+    """Reconciles an in-flight Gmail draft by checking X-Assistant-Approval-Id marker."""
+    access_token = await get_valid_access_token(user_id)
+    if not access_token or not approval_id:
+        return None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        list_resp = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts?maxResults=20",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if list_resp.status_code >= 400:
+            return None
+        drafts = list_resp.json().get("drafts", []) or []
+        for d in drafts:
+            did = d.get("id")
+            if not did:
+                continue
+            det_resp = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/drafts/{did}?format=full",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if det_resp.status_code >= 400:
+                continue
+            det = det_resp.json()
+            headers = det.get("message", {}).get("payload", {}).get("headers", []) or []
+            marker = next((h.get("value") for h in headers if (h.get("name") or "").lower() == "x-assistant-approval-id"), None)
+            if marker == approval_id:
+                return did
+    return None

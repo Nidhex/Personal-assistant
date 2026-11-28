@@ -755,15 +755,6 @@ def init_db(conn: Optional[Any] = None, adapter: Optional[str] = None, **kwargs)
         except Exception:
             pass
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS workspace_shares (
-            token TEXT PRIMARY KEY,
-            workspace_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-
     for col, col_type in [
         ("embedding", "TEXT"),
     ]:

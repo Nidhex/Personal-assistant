@@ -1178,17 +1178,25 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
             from .google_service import create_gmail_draft
             draft_id = row["gmail_draft_id"]
             if not draft_id:
+                cursor.execute(
+                    "UPDATE user_approvals SET gmail_draft_id = 'creating' WHERE id = ? AND user_id = ?",
+                    (approval_id, user["id"])
+                )
+                conn.commit()
                 try:
                     draft_id = await create_gmail_draft(
                         user["id"],
                         row["target"] or "",
                         row["subject"] or "Draft",
                         row["draft_content"] or "",
+                        approval_id=approval_id,
                     )
                 except Exception as e:
-                    conn.rollback()
                     conn.close()
-                    raise HTTPException(status_code=400, detail=str(e))
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Gmail draft outcome uncertain ({e}). A draft may already exist in your Gmail; please check before retrying.",
+                    )
                 cursor.execute(
                     "UPDATE user_approvals SET gmail_draft_id = ? WHERE id = ? AND user_id = ?",
                     (draft_id, approval_id, user["id"])
@@ -2143,7 +2151,7 @@ def record_question_result(req: QuestionResultRequest, user: dict = Depends(get_
         )
         conn.commit()
         conn.close()
-    return {"success": True, "result": req.result, "requeued_task_id": requeuled_id}
+    return {"success": True, "result": req.result, "requeued_task_id": requeued_id}
 
 
 @app.get("/api/user/workspaces/{workspace_id}/export")
@@ -2246,9 +2254,34 @@ def generate_planning_milestones(req: PlanningGenerateRequest, user: dict = Depe
     if not goal:
         raise HTTPException(status_code=400, detail="Goal is required.")
     target = (req.target_date or "Next Week").strip()
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if api_key:
+        try:
+            from google import genai
+            client = genai.Client(api_key=api_key)
+            prompt = (
+                f"Break down the goal '{goal}' (target date: {target}) into 3 to 5 concrete milestones. "
+                f"Return ONLY a JSON array of objects with keys: id, title, due_date, status ('pending' or 'in_progress')."
+            )
+            resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            raw = (resp.text or "").strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`").replace("json", "", 1).strip()
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and len(parsed) >= 3:
+                return {"success": True, "goal": goal, "target_date": target, "milestones": parsed[:6]}
+        except Exception:
+            pass
+
+    now = datetime.now(timezone.utc)
+    d1 = now.strftime("%Y-%m-%d")
+    d2 = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+    d3 = (now + timedelta(days=4)).strftime("%Y-%m-%d")
     milestones = [
-        {"id": "ms_1", "title": f"Define scope & milestones for: {goal}", "due_date": "Today", "status": "in_progress"},
-        {"id": "ms_2", "title": f"Execute core deliverables for: {goal}", "due_date": target, "status": "pending"},
-        {"id": "ms_3", "title": f"Review & finalize: {goal}", "due_date": target, "status": "pending"},
+        {"id": "ms_1", "title": f"Research & outline requirements for {goal}", "due_date": d1, "status": "in_progress"},
+        {"id": "ms_2", "title": f"Build core deliverable for {goal}", "due_date": d2, "status": "pending"},
+        {"id": "ms_3", "title": f"Test & verify {goal}", "due_date": d3, "status": "pending"},
+        {"id": "ms_4", "title": f"Finalize & deliver {goal}", "due_date": target, "status": "pending"},
     ]
     return {"success": True, "goal": goal, "target_date": target, "milestones": milestones}
