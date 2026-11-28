@@ -99,7 +99,6 @@ class TestQAPhase1AuthAndGoogle(unittest.TestCase):
         for scope in data["scopes_requested"]:
             self.assertNotIn("modify", scope)
             self.assertNotIn("send", scope)
-            self.assertNotIn("compose", scope)
 
     def test_02_unauthenticated_api_requests_return_401(self):
         """Verifies unauthorized requests to protected endpoints return 401."""

@@ -239,10 +239,77 @@ def extract_topics_from_text(text: str, filename: str = "Notes") -> List[Dict[st
 # -------------------------------------------------------------
 # 1. CONTEXT BUILDER (STRICT USER & WORKSPACE ISOLATION)
 # -------------------------------------------------------------
+def generate_embedding(text: str) -> Optional[List[float]]:
+    """Generates a Gemini text-embedding if GEMINI_API_KEY is set, else returns None."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key or not text:
+        return None
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        resp = client.models.embed_content(model="text-embedding-004", contents=text[:4000])
+        if resp and getattr(resp, "embeddings", None):
+            return list(resp.embeddings[0].values)
+    except Exception:
+        pass
+    return None
+
+
+def _cosine_sim(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def retrieve_relevant_notes(user_id: str, workspace_id: Optional[str], query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    """Retrieves top-k relevant workspace notes using embeddings or keyword fallback."""
+    conn = get_db()
+    cursor = conn.cursor()
+    if workspace_id and workspace_id != "main":
+        cursor.execute(
+            "SELECT id, title, content, embedding FROM user_workspace_notes WHERE user_id = ? AND workspace_id = ?",
+            (user_id, workspace_id),
+        )
+    else:
+        cursor.execute(
+            "SELECT id, title, content, embedding FROM user_workspace_notes WHERE user_id = ?",
+            (user_id,),
+        )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    if not rows:
+        return []
+
+    q_emb = generate_embedding(query)
+    q_words = set(re.findall(r"\w+", (query or "").lower()))
+
+    scored = []
+    for r in rows:
+        score = 0.0
+        if q_emb and r.get("embedding"):
+            try:
+                emb = json.loads(r["embedding"])
+                score = _cosine_sim(q_emb, emb)
+            except Exception:
+                score = 0.0
+        else:
+            text = f"{r.get('title', '')} {r.get('content', '')}".lower()
+            t_words = set(re.findall(r"\w+", text))
+            score = float(len(q_words & t_words))
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:top_k]]
+
+
 def build_context(
     user_id: str,
     workspace_id: Optional[str] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    query: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Constructs authorized, scoped context for the assistant:
@@ -287,8 +354,12 @@ def build_context(
             context["workspace"] = dict(ws_row)
 
             # Workspace notes (isolated to this workspace and user)
-            cursor.execute("SELECT id, title, content FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 10", (workspace_id, user_id))
-            context["notes"] = [dict(r) for r in cursor.fetchall()]
+            if query and query.strip():
+                relevant = retrieve_relevant_notes(user_id, workspace_id, query, top_k=5)
+                context["notes"] = [{"id": n["id"], "title": n["title"], "content": n["content"]} for n in relevant]
+            else:
+                cursor.execute("SELECT id, title, content FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 10", (workspace_id, user_id))
+                context["notes"] = [dict(r) for r in cursor.fetchall()]
 
             # Workspace tasks (isolated to this workspace and user)
             cursor.execute("SELECT id, title, due_date, priority, completed FROM user_tasks WHERE (workspace = ? OR workspace = ?) AND user_id = ? ORDER BY created_at DESC LIMIT 15", (ws_row["name"], ws_row["id"], user_id))

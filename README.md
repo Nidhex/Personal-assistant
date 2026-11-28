@@ -633,3 +633,14 @@ Contributions are welcome. Please follow these guidelines:
 ## License
 
 A formal open-source license has not yet been selected for this project. All rights are currently reserved by the repository owner.
+
+
+## Semantic search (optional)
+
+Workspace note semantic search uses Gemini embeddings when both `google-genai` and `GEMINI_API_KEY` are configured:
+
+```bash
+pip install google-genai
+```
+
+Set `GEMINI_API_KEY` in your environment. Without both `google-genai` and `GEMINI_API_KEY`, workspace note retrieval falls back to keyword matching only.

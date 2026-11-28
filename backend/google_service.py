@@ -130,7 +130,8 @@ GOOGLE_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/gmail.readonly"
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
 ]
 
 def is_google_configured() -> bool:
@@ -518,3 +519,102 @@ async def fetch_gmail_message_detail(user_id: str, message_id: str):
         "isUnread": "UNREAD" in msg_data.get("labelIds", []),
         "labels": msg_data.get("labelIds", [])
     }
+
+
+async def create_gmail_draft(user_id: str, to: str, subject: str, body: str, approval_id: str = "") -> str:
+    """Creates a Gmail draft via users.drafts.create. Never sends email."""
+    import base64
+    from email.message import EmailMessage
+
+    access_token = await get_valid_access_token(user_id)
+    if not access_token:
+        raise Exception("Google account not connected or token expired. Please re-authorize Google OAuth.")
+
+    msg = EmailMessage()
+    msg["To"] = to or ""
+    msg["Subject"] = subject or "Draft"
+    if approval_id:
+        msg["X-Assistant-Approval-Id"] = approval_id
+    msg.set_content(body or "")
+    raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"message": {"raw": raw_b64}},
+        )
+    if resp.status_code == 403:
+        raise Exception("Gmail compose permission missing. Please re-authorize Google OAuth to grant gmail.compose.")
+    if resp.status_code >= 400:
+        raise Exception(f"Gmail draft creation failed ({resp.status_code}).")
+    data = resp.json()
+    draft_id = (data.get("id") or "").strip()
+    if not draft_id:
+        raise RuntimeError("UNCERTAIN_DRAFT_OUTCOME: Gmail draft API returned no draft ID.")
+    return draft_id
+
+
+def _norm_text(val: str) -> str:
+    return (val or "").replace("\r\n", "\n").strip()
+
+
+def _extract_gmail_body(payload: dict) -> str:
+    import base64
+    data = (payload.get("body") or {}).get("data")
+    if data:
+        padded = data + "=" * (-len(data) % 4)
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="replace")
+    for part in payload.get("parts") or []:
+        if (part.get("mimeType") or "").lower() == "text/plain":
+            pdata = (part.get("body") or {}).get("data")
+            if pdata:
+                padded = pdata + "=" * (-len(pdata) % 4)
+                return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="replace")
+    return ""
+
+
+async def reconcile_gmail_draft(
+    user_id: str,
+    approval_id: str,
+    expected_to: str = "",
+    expected_subject: str = "",
+    expected_body: str = "",
+) -> str | None:
+    """Reconciles an in-flight Gmail draft. Adoption requires exact X-Assistant-Approval-Id marker AND exact content (To, Subject, Body) match."""
+    access_token = await get_valid_access_token(user_id)
+    if not access_token or not approval_id:
+        return None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        list_resp = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts?maxResults=20",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if list_resp.status_code >= 400:
+            return None
+        drafts = list_resp.json().get("drafts", []) or []
+        for d in drafts:
+            did = d.get("id")
+            if not did:
+                continue
+            det_resp = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/drafts/{did}?format=full",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if det_resp.status_code >= 400:
+                continue
+            det = det_resp.json()
+            payload = det.get("message", {}).get("payload", {}) or {}
+            headers = payload.get("headers", []) or []
+            hmap = {(h.get("name") or "").lower(): (h.get("value") or "") for h in headers}
+            if hmap.get("x-assistant-approval-id") != approval_id:
+                continue
+            body_text = _extract_gmail_body(payload)
+            if (
+                _norm_text(hmap.get("to", "")) == _norm_text(expected_to)
+                and _norm_text(hmap.get("subject", "")) == _norm_text(expected_subject)
+                and _norm_text(body_text) == _norm_text(expected_body)
+            ):
+                return did
+            return None
+    return None

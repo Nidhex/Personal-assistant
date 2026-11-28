@@ -215,3 +215,23 @@ def build_timestamp_sections(snippets: List[Dict[str, Any]]) -> List[Dict[str, A
         })
 
     return topics
+
+
+def extract_youtube_playlist_id(url: str) -> str | None:
+    if not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw or len(raw) > MAX_URL_LEN:
+        return None
+    parsed = urlparse(raw)
+    if parsed.scheme != "https" or parsed.username is not None or parsed.password is not None or ":" in (parsed.netloc or ""):
+        return None
+    host = (parsed.hostname or "").lower()
+    if host not in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        return None
+    if parsed.path == "/playlist":
+        qs = parse_qs(parsed.query)
+        vals = qs.get("list", [])
+        if len(vals) == 1 and re.match(r"^[A-Za-z0-9_-]{10,64}$", vals[0]):
+            return vals[0]
+    return None
