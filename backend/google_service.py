@@ -555,8 +555,33 @@ async def create_gmail_draft(user_id: str, to: str, subject: str, body: str, app
     return draft_id
 
 
-async def reconcile_gmail_draft(user_id: str, approval_id: str, expected_body: str = "") -> str | None:
-    """Reconciles an in-flight Gmail draft by checking X-Assistant-Approval-Id marker."""
+def _norm_text(val: str) -> str:
+    return (val or "").replace("\r\n", "\n").strip()
+
+
+def _extract_gmail_body(payload: dict) -> str:
+    import base64
+    data = (payload.get("body") or {}).get("data")
+    if data:
+        padded = data + "=" * (-len(data) % 4)
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="replace")
+    for part in payload.get("parts") or []:
+        if (part.get("mimeType") or "").lower() == "text/plain":
+            pdata = (part.get("body") or {}).get("data")
+            if pdata:
+                padded = pdata + "=" * (-len(pdata) % 4)
+                return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="replace")
+    return ""
+
+
+async def reconcile_gmail_draft(
+    user_id: str,
+    approval_id: str,
+    expected_to: str = "",
+    expected_subject: str = "",
+    expected_body: str = "",
+) -> str | None:
+    """Reconciles an in-flight Gmail draft. Adoption requires exact X-Assistant-Approval-Id marker AND exact content (To, Subject, Body) match."""
     access_token = await get_valid_access_token(user_id)
     if not access_token or not approval_id:
         return None
@@ -579,8 +604,17 @@ async def reconcile_gmail_draft(user_id: str, approval_id: str, expected_body: s
             if det_resp.status_code >= 400:
                 continue
             det = det_resp.json()
-            headers = det.get("message", {}).get("payload", {}).get("headers", []) or []
-            marker = next((h.get("value") for h in headers if (h.get("name") or "").lower() == "x-assistant-approval-id"), None)
-            if marker == approval_id:
+            payload = det.get("message", {}).get("payload", {}) or {}
+            headers = payload.get("headers", []) or []
+            hmap = {(h.get("name") or "").lower(): (h.get("value") or "") for h in headers}
+            if hmap.get("x-assistant-approval-id") != approval_id:
+                continue
+            body_text = _extract_gmail_body(payload)
+            if (
+                _norm_text(hmap.get("to", "")) == _norm_text(expected_to)
+                and _norm_text(hmap.get("subject", "")) == _norm_text(expected_subject)
+                and _norm_text(body_text) == _norm_text(expected_body)
+            ):
                 return did
+            return None
     return None

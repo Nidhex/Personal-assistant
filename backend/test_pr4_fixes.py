@@ -208,9 +208,116 @@ def test_mocked_gemini_planning():
 
     fake_genai = MagicMock()
     fake_genai.Client.return_value = mock_client
+    fake_google = MagicMock()
+    fake_google.genai = fake_genai
     with patch.dict(os.environ, {"GEMINI_API_KEY": "fake_key"}):
-        with patch.dict(sys.modules, {"google.genai": fake_genai}):
+        with patch.dict(sys.modules, {"google": fake_google, "google.genai": fake_genai}):
             res = client.post("/api/planning/generate", json={"goal": "Launch App", "target_date": "2026-12-05"})
     assert res.status_code == 200
     assert len(res.json()["milestones"]) == 3
     assert res.json()["milestones"][0]["title"] == "Step 1"
+
+
+def test_reconcile_marker_content_validation():
+    import asyncio
+    import base64
+    from backend.google_service import reconcile_gmail_draft
+
+    def _b64(s: str) -> str:
+        return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii")
+
+    def _mock_client(headers_list, body_text):
+        list_resp = MagicMock(status_code=200)
+        list_resp.json.return_value = {"drafts": [{"id": "d_match"}]}
+        det_resp = MagicMock(status_code=200)
+        det_resp.json.return_value = {
+            "message": {
+                "payload": {
+                    "headers": headers_list,
+                    "body": {"data": _b64(body_text)},
+                }
+            }
+        }
+        client_inst = AsyncMock()
+        client_inst.get.side_effect = [list_resp, det_resp]
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client_inst)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    with patch("backend.google_service.get_valid_access_token", new=AsyncMock(return_value="tok")):
+        # 1. Exact marker + content match -> adopts
+        with patch("httpx.AsyncClient", return_value=_mock_client([
+            {"name": "X-Assistant-Approval-Id", "value": "appr_1"},
+            {"name": "To", "value": "a@b.com"},
+            {"name": "Subject", "value": "Subj"},
+        ], "Body")):
+            assert asyncio.run(reconcile_gmail_draft("u1", "appr_1", "a@b.com", "Subj", "Body")) == "d_match"
+
+        # 2. Marker matches but body altered -> None
+        with patch("httpx.AsyncClient", return_value=_mock_client([
+            {"name": "X-Assistant-Approval-Id", "value": "appr_1"},
+            {"name": "To", "value": "a@b.com"},
+            {"name": "Subject", "value": "Subj"},
+        ], "Altered Body")):
+            assert asyncio.run(reconcile_gmail_draft("u1", "appr_1", "a@b.com", "Subj", "Body")) is None
+
+        # 3. Marker matches but recipient altered -> None
+        with patch("httpx.AsyncClient", return_value=_mock_client([
+            {"name": "X-Assistant-Approval-Id", "value": "appr_1"},
+            {"name": "To", "value": "evil@b.com"},
+            {"name": "Subject", "value": "Subj"},
+        ], "Body")):
+            assert asyncio.run(reconcile_gmail_draft("u1", "appr_1", "a@b.com", "Subj", "Body")) is None
+
+        # 4. No marker -> None
+        with patch("httpx.AsyncClient", return_value=_mock_client([
+            {"name": "To", "value": "a@b.com"},
+            {"name": "Subject", "value": "Subj"},
+        ], "Body")):
+            assert asyncio.run(reconcile_gmail_draft("u1", "appr_1", "a@b.com", "Subj", "Body")) is None
+
+
+def test_concurrent_email_draft_approve_only_creates_once():
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    init_db()
+    uid = "test_pr4_conc_user"
+    _setup_user(uid, "pr4conc@example.com")
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
+        VALUES ('appr_conc_1', ?, 'Email Draft', 'a@b.com', 'Subj', 'Reason', 'Medium', 'Body', 'pending', datetime('now'))
+        """,
+        (uid,),
+    )
+    conn.commit()
+    conn.close()
+
+    async def _slow_create(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return "draft_concurrent_1"
+
+    mock_create = AsyncMock(side_effect=_slow_create)
+    barrier = threading.Barrier(2)
+
+    def _call():
+        c = _client_for(uid)
+        barrier.wait(timeout=5)
+        return c.post("/api/user/approvals/appr_conc_1/action", json={"action": "approve"})
+
+    with patch("backend.google_service.create_gmail_draft", new=mock_create):
+        with patch("backend.google_service.reconcile_gmail_draft", new=AsyncMock(return_value=None)):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                r1, r2 = list(pool.map(lambda _: _call(), range(2)))
+
+    assert mock_create.call_count == 1
+    assert 200 in (r1.status_code, r2.status_code)
+    conn = get_db()
+    row = conn.execute("SELECT status, gmail_draft_id FROM user_approvals WHERE id = 'appr_conc_1'").fetchone()
+    conn.close()
+    assert row["status"] == "approved"
+    assert row["gmail_draft_id"] == "draft_concurrent_1"

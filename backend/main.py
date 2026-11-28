@@ -1332,7 +1332,13 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
     if req.action == "approve" and approval_type == "Email Draft" and row["gmail_draft_id"] == "creating":
         import uuid
         from .google_service import reconcile_gmail_draft
-        reconciled_id = await reconcile_gmail_draft(user["id"], approval_id, row["draft_content"] or "")
+        reconciled_id = await reconcile_gmail_draft(
+            user["id"],
+            approval_id,
+            expected_to=row["target"] or "",
+            expected_subject=row["subject"] or "",
+            expected_body=row["draft_content"] or "",
+        )
         if reconciled_id:
             cursor.execute(
                 "UPDATE user_approvals SET gmail_draft_id = ? WHERE id = ? AND user_id = ?",
