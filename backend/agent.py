@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import uuid
 import httpx
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
@@ -105,6 +106,73 @@ def parse_relative_date(date_str: str) -> str:
             pass
     return date_str.strip()
 
+
+# -------------------------------------------------------------
+# WORKSPACE IDENTITY RESOLUTION
+# -------------------------------------------------------------
+def resolve_agent_workspace(
+    cursor,
+    user_id: str,
+    workspace_ref: Optional[str],
+    allow_legacy_tasks: bool = False
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Resolves a workspace reference (ID or display name) to:
+      (canonical_id, display_name, error_status)
+
+    error_status can be:
+      - None: Success
+      - "cross_user": Explicit ID belongs to another user
+      - "ambiguous": Name matches multiple workspaces for this user
+      - "not_found": Workspace entity not found for this user
+    """
+    if not workspace_ref or not str(workspace_ref).strip():
+        return (None, None, None)
+
+    ref = str(workspace_ref).strip()
+    if ref.lower() in ("general", "main"):
+        return ("General", "General", None)
+
+    # 1. Direct match on user_workspaces.id for authenticated user
+    cursor.execute("SELECT id, name FROM user_workspaces WHERE lower(id) = lower(?) AND user_id = ?", (ref, user_id))
+    row = cursor.fetchone()
+    if row:
+        return (row["id"], row["name"], None)
+
+    # Cross-user check: does this ID belong to another user?
+    cursor.execute("SELECT id FROM user_workspaces WHERE lower(id) = lower(?)", (ref,))
+    if cursor.fetchone():
+        return (None, None, "cross_user")
+
+    # 2. Match by workspace name for this user
+    cursor.execute(
+        "SELECT id, name FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?) ORDER BY created_at ASC",
+        (user_id, ref)
+    )
+    rows = cursor.fetchall()
+    if len(rows) == 1:
+        return (rows[0]["id"], rows[0]["name"], None)
+    elif len(rows) > 1:
+        return (None, None, "ambiguous")
+
+    # 3. Match exact unassociated legacy text label in user_tasks for this user ONLY if caller explicitly allows it
+    if allow_legacy_tasks and not ref.lower().startswith("ws_"):
+        cursor.execute(
+            "SELECT DISTINCT workspace FROM user_tasks WHERE user_id = ? AND lower(workspace) = lower(?)",
+            (user_id, ref)
+        )
+        task_ws_rows = cursor.fetchall()
+        if len(task_ws_rows) == 1:
+            exact_ws = task_ws_rows[0]["workspace"]
+            # A legacy task label is NOT a verified workspace ID (canonical_id is None)
+            return (None, exact_ws, None)
+        elif len(task_ws_rows) > 1:
+            # Conflicting duplicate legacy labels with differing case representations
+            return (None, None, "ambiguous")
+
+    return (None, None, "not_found")
+
+
 # -------------------------------------------------------------
 # CALENDAR CONFLICT DETECTOR
 # -------------------------------------------------------------
@@ -113,7 +181,8 @@ def detect_calendar_conflicts(
     event_date: str,
     start_time: str,
     end_time: str,
-    exclude_event_id: Optional[str] = None
+    exclude_event_id: Optional[str] = None,
+    cursor: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
     """
     Checks for overlapping calendar blocks on event_date.
@@ -124,15 +193,22 @@ def detect_calendar_conflicts(
     if n_end <= n_start:
         n_end = n_start + 60
 
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
+    should_close = False
+    if cursor is None:
+        conn = get_db()
+        cur = conn.cursor()
+        should_close = True
+    else:
+        cur = cursor
+
+    cur.execute("""
         SELECT id, title, event_date, start_time, end_time, category, description
         FROM user_calendar_events
         WHERE user_id = ? AND event_date = ?
     """, (user_id, event_date))
-    rows = cursor.fetchall()
-    conn.close()
+    rows = cur.fetchall()
+    if should_close:
+        conn.close()
 
     conflicts = []
     for r in rows:
@@ -362,7 +438,33 @@ def build_context(
                 context["notes"] = [dict(r) for r in cursor.fetchall()]
 
             # Workspace tasks (isolated to this workspace and user)
-            cursor.execute("SELECT id, title, due_date, priority, completed FROM user_tasks WHERE (workspace = ? OR workspace = ?) AND user_id = ? ORDER BY created_at DESC LIMIT 15", (ws_row["name"], ws_row["id"], user_id))
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+                (user_id, ws_row["name"])
+            )
+            cnt_row = cursor.fetchone()
+            is_name_unique = (cnt_row["count"] if cnt_row else 0) == 1
+
+            if is_name_unique:
+                cursor.execute(
+                    """
+                    SELECT id, title, due_date, priority, completed
+                    FROM user_tasks
+                    WHERE user_id = ? AND (workspace = ? OR workspace = ?)
+                    ORDER BY created_at DESC LIMIT 15
+                    """,
+                    (user_id, ws_row["id"], ws_row["name"])
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, title, due_date, priority, completed
+                    FROM user_tasks
+                    WHERE user_id = ? AND workspace = ?
+                    ORDER BY created_at DESC LIMIT 15
+                    """,
+                    (user_id, ws_row["id"])
+                )
             context["tasks"] = [dict(r) for r in cursor.fetchall()]
 
             # Workspace calendar events
@@ -370,7 +472,16 @@ def build_context(
             context["calendar_events"] = [dict(r) for r in cursor.fetchall()]
 
             # Workspace revision plans
-            cursor.execute("SELECT id, exam_date, plan_json FROM user_revision_plans WHERE workspace_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1", (workspace_id, user_id))
+            if is_name_unique:
+                cursor.execute(
+                    "SELECT id, exam_date, plan_json FROM user_revision_plans WHERE user_id = ? AND (workspace_id = ? OR workspace_id = ?) ORDER BY created_at DESC LIMIT 1",
+                    (user_id, ws_row["id"], ws_row["name"])
+                )
+            else:
+                cursor.execute(
+                    "SELECT id, exam_date, plan_json FROM user_revision_plans WHERE user_id = ? AND workspace_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (user_id, ws_row["id"])
+                )
             plan_row = cursor.fetchone()
             if plan_row:
                 context["revision_plans"] = [dict(plan_row)]
@@ -823,8 +934,8 @@ Try asking me:
 async def execute_policy_gate_and_tools(
     model_output: str,
     user_id: str,
-    workspace_id: Optional[str],
-    kill_switch_active: bool,
+    workspace_id: Optional[str] = None,
+    kill_switch_active: bool = False,
     email_derived: bool = False
 ) -> Dict[str, Any]:
     """
@@ -887,7 +998,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Blocked', '0ms', ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Tool: {tool_name}", "Halted by emergency kill switch", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Tool: {tool_name}", "Halted by emergency kill switch", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
         return result
@@ -899,14 +1010,14 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Refused', '0ms', ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Tool: {tool_name}", "Unauthorized tool requested", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Tool: {tool_name}", "Unauthorized tool requested", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
         return result
 
     # Rule 3: Human Approval Requirement for Outbound Actions
     if tool_name == "propose_draft":
-        approval_id = f"appr_{int(time.time()*1000)}"
+        approval_id = f"appr_{uuid.uuid4().hex}"
         cursor.execute("""
             INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
             VALUES (?, ?, 'Email Draft', ?, ?, ?, 'Medium', ?, 'pending', ?)
@@ -931,11 +1042,30 @@ async def execute_policy_gate_and_tools(
 
     # Determine workspace name if in workspace
     ws_name = "General"
-    if workspace_id and workspace_id != "main":
-        cursor.execute("SELECT name FROM user_workspaces WHERE id = ? AND user_id = ?", (workspace_id, user_id))
-        r = cursor.fetchone()
-        if r:
-            ws_name = r["name"]
+    ws_canonical_id = "General"
+    if workspace_id and str(workspace_id).strip() and str(workspace_id).strip().lower() not in ("main", "general"):
+        cid, name, err = resolve_agent_workspace(cursor, user_id, workspace_id)
+        if err == "cross_user":
+            conn.close()
+            result["tool_executed"] = tool_name
+            result["policy_decision"] = "Refused: Access denied to workspace"
+            result["text"] = "Security Refusal: Access denied to workspace."
+            return result
+        elif err == "ambiguous":
+            conn.close()
+            result["tool_executed"] = tool_name
+            result["policy_decision"] = "Refused: Ambiguous workspace name"
+            result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{workspace_id}'. Please specify the exact workspace ID."
+            return result
+        elif err == "not_found":
+            conn.close()
+            result["tool_executed"] = tool_name
+            result["policy_decision"] = "Refused: Workspace not found"
+            result["text"] = f"Workspace '{workspace_id}' not found."
+            return result
+        elif cid:
+            ws_canonical_id = cid
+            ws_name = name
 
     latency_ms = f"{int((time.time() - start_time) * 1000)}ms"
 
@@ -945,18 +1075,44 @@ async def execute_policy_gate_and_tools(
         priority = params.get("priority", "normal")
         if priority not in ("normal", "high"):
             priority = "normal"
-        target_ws = params.get("workspace") or ws_name
         source_email_id = params.get("source_email_id")
         due_date = parse_relative_date(raw_due)
+
+        target_ws_id = ws_canonical_id
+        target_ws_name = ws_name
+        req_ws = params.get("workspace")
+        if req_ws and str(req_ws).strip():
+            cid, name, err = resolve_agent_workspace(cursor, user_id, req_ws)
+            if err == "cross_user":
+                conn.close()
+                result["tool_executed"] = "propose_task"
+                result["policy_decision"] = "Refused: Access denied to workspace"
+                result["text"] = "Security Refusal: Access denied to workspace."
+                return result
+            elif err == "ambiguous":
+                conn.close()
+                result["tool_executed"] = "propose_task"
+                result["policy_decision"] = "Refused: Ambiguous workspace name"
+                result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{req_ws}'. Please specify the exact workspace ID."
+                return result
+            elif err == "not_found":
+                conn.close()
+                result["tool_executed"] = "propose_task"
+                result["policy_decision"] = "Refused: Workspace not found"
+                result["text"] = f"Workspace '{req_ws}' not found."
+                return result
+            elif cid:
+                target_ws_id = cid
+                target_ws_name = name
 
         payload = {
             "title": raw_title,
             "due_date": due_date,
             "priority": priority,
-            "workspace": target_ws,
+            "workspace": target_ws_id,
             "source_email_id": source_email_id,
         }
-        approval_id = f"appr_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        approval_id = f"appr_{uuid.uuid4().hex}"
         email_subject = params.get("subject") or raw_title
         cursor.execute("""
             INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
@@ -974,7 +1130,7 @@ async def execute_policy_gate_and_tools(
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
         """, (
-            f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+            f"act_{uuid.uuid4().hex}",
             user_id,
             f"Tool: propose_task",
             latency_ms,
@@ -998,7 +1154,7 @@ async def execute_policy_gate_and_tools(
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Refused', ?, ?, ?)
         """, (
-            f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+            f"act_{uuid.uuid4().hex}",
             user_id,
             "Tool: create_task",
             latency_ms,
@@ -1017,13 +1173,67 @@ async def execute_policy_gate_and_tools(
         query = "SELECT id, title, due_date, priority, completed, workspace FROM user_tasks WHERE user_id = ?"
         q_params: List[Any] = [user_id]
 
-        target_ws = params.get("workspace_name")
-        if target_ws:
-            query += " AND (lower(workspace) = lower(?) OR lower(workspace) LIKE ?)"
-            q_params.extend([target_ws, f"%{target_ws.lower()}%"])
+        target_ws = params.get("workspace_name") or params.get("workspace")
+        if target_ws and str(target_ws).strip():
+            cid, name, err = resolve_agent_workspace(cursor, user_id, target_ws, allow_legacy_tasks=True)
+            if err == "cross_user":
+                conn.close()
+                result["tool_executed"] = "list_tasks"
+                result["policy_decision"] = "Refused: Access denied to workspace"
+                result["text"] = "Security Refusal: Access denied to workspace."
+                return result
+            elif err == "ambiguous":
+                conn.close()
+                result["tool_executed"] = "list_tasks"
+                result["policy_decision"] = "Refused: Ambiguous workspace name"
+                result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{target_ws}'. Please specify the exact workspace ID."
+                return result
+            elif err == "not_found":
+                conn.close()
+                result["tool_executed"] = "list_tasks"
+                result["policy_decision"] = "Refused: Workspace not found"
+                result["text"] = f"Workspace '{target_ws}' not found."
+                return result
+            elif cid:
+                is_name_unique = False
+                if name and name.lower() != "general":
+                    cursor.execute(
+                        "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+                        (user_id, name)
+                    )
+                    cnt_row = cursor.fetchone()
+                    is_name_unique = (cnt_row["count"] if cnt_row else 0) == 1
+
+                if name and name.lower() == "general":
+                    query += " AND (workspace = 'General' OR workspace = ?)"
+                    q_params.append(cid)
+                elif is_name_unique:
+                    query += " AND (workspace = ? OR workspace = ?)"
+                    q_params.extend([cid, name])
+                else:
+                    query += " AND workspace = ?"
+                    q_params.append(cid)
+            elif name:
+                # Exact legacy task-label fallback (not a verified workspace ID)
+                query += " AND workspace = ?"
+                q_params.append(name)
         elif workspace_id and workspace_id != "main":
-            query += " AND (workspace = ? OR workspace = ?)"
-            q_params.extend([ws_name, workspace_id])
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+                (user_id, ws_name)
+            )
+            cnt_row = cursor.fetchone()
+            is_name_unique = (cnt_row["count"] if cnt_row else 0) == 1
+
+            if ws_name and ws_name.lower() == "general":
+                query += " AND (workspace = 'General' OR workspace = ?)"
+                q_params.append(ws_canonical_id)
+            elif is_name_unique:
+                query += " AND (workspace = ? OR workspace = ?)"
+                q_params.extend([ws_canonical_id, ws_name])
+            else:
+                query += " AND workspace = ?"
+                q_params.append(ws_canonical_id)
 
         if flt == "pending":
             query += " AND completed = 0"
@@ -1045,7 +1255,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, 'List Tasks', 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, latency_ms, f"Retrieved {len(task_rows)} tasks", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, latency_ms, f"Retrieved {len(task_rows)} tasks", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
@@ -1060,29 +1270,56 @@ async def execute_policy_gate_and_tools(
         return result
 
     if tool_name == "create_multiple_tasks":
+        target_ws_id = ws_canonical_id
+        target_ws_name = ws_name
+        req_ws = params.get("workspace")
+        if req_ws and str(req_ws).strip():
+            cid, name, err = resolve_agent_workspace(cursor, user_id, req_ws)
+            if err == "cross_user":
+                conn.close()
+                result["tool_executed"] = "create_multiple_tasks"
+                result["policy_decision"] = "Refused: Access denied to workspace"
+                result["text"] = "Security Refusal: Access denied to workspace."
+                return result
+            elif err == "ambiguous":
+                conn.close()
+                result["tool_executed"] = "create_multiple_tasks"
+                result["policy_decision"] = "Refused: Ambiguous workspace name"
+                result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{req_ws}'. Please specify the exact workspace ID."
+                return result
+            elif err == "not_found":
+                conn.close()
+                result["tool_executed"] = "create_multiple_tasks"
+                result["policy_decision"] = "Refused: Workspace not found"
+                result["text"] = f"Workspace '{req_ws}' not found."
+                return result
+            elif cid:
+                target_ws_id = cid
+                target_ws_name = name
+
         tasks_to_create = params.get("tasks", [])
         created_titles = []
         for t_spec in tasks_to_create:
             t_title = t_spec.get("title", "Milestone Task").strip()
             t_due = parse_relative_date(t_spec.get("due_date", "Today"))
             t_prio = t_spec.get("priority", "normal")
-            tid = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{os.urandom(2).hex()}"
+            tid = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
             cursor.execute("""
                 INSERT INTO user_tasks (id, user_id, title, source, due_date, priority, completed, workspace, created_at)
                 VALUES (?, ?, ?, 'Chat Assistant', ?, ?, 0, ?, ?)
-            """, (tid, user_id, t_title, t_due, t_prio, ws_name, datetime.now(timezone.utc).isoformat()))
+            """, (tid, user_id, t_title, t_due, t_prio, target_ws_id, datetime.now(timezone.utc).isoformat()))
             created_titles.append(f"**{t_title}** (Due: {t_due})")
 
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, 'Create Multiple Tasks', 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, latency_ms, f"Created {len(created_titles)} tasks", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, latency_ms, f"Created {len(created_titles)} tasks", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
         result["tool_executed"] = "create_multiple_tasks"
         result["policy_decision"] = "Allowed & Executed"
-        result["text"] = f"Created {len(created_titles)} tasks in workspace `{ws_name}`:\n" + "\n".join([f"- {t}" for t in created_titles])
+        result["text"] = f"Created {len(created_titles)} tasks in workspace `{target_ws_name}`:\n" + "\n".join([f"- {t}" for t in created_titles])
         return result
 
     if tool_name == "update_task":
@@ -1116,7 +1353,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Update Task: {t_row['title']}", latency_ms, f"Updated deadline to {parsed_due}", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Update Task: {t_row['title']}", latency_ms, f"Updated deadline to {parsed_due}", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
@@ -1131,35 +1368,83 @@ async def execute_policy_gate_and_tools(
         priority = params.get("priority", "normal")
         due_date = parse_relative_date(raw_due)
 
+        target_ws_id = ws_canonical_id
+        target_ws_name = ws_name
+
+        req_ws = params.get("workspace")
+        if req_ws and str(req_ws).strip():
+            cid, name, err = resolve_agent_workspace(cursor, user_id, req_ws)
+            if err == "cross_user":
+                conn.close()
+                result["tool_executed"] = "create_task"
+                result["policy_decision"] = "Refused: Access denied to workspace"
+                result["text"] = "Security Refusal: Access denied to workspace."
+                return result
+            elif err == "ambiguous":
+                conn.close()
+                result["tool_executed"] = "create_task"
+                result["policy_decision"] = "Refused: Ambiguous workspace name"
+                result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{req_ws}'. Please specify the exact workspace ID."
+                return result
+            elif err == "not_found":
+                conn.close()
+                result["tool_executed"] = "create_task"
+                result["policy_decision"] = "Refused: Workspace not found"
+                result["text"] = f"Workspace '{req_ws}' not found."
+                return result
+            elif cid:
+                target_ws_id = cid
+                target_ws_name = name
+
         # Check duplicate in same workspace for user
-        cursor.execute("""
-            SELECT id FROM user_tasks 
-            WHERE user_id = ? AND lower(title) = lower(?) AND completed = 0 AND (workspace = ? OR workspace = ?)
-        """, (user_id, raw_title, ws_name, workspace_id or "General"))
+        is_name_unique = False
+        if target_ws_name and target_ws_name.lower() != "general":
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+                (user_id, target_ws_name)
+            )
+            cnt_row = cursor.fetchone()
+            is_name_unique = (cnt_row["count"] if cnt_row else 0) == 1
+
+        if target_ws_name.lower() == "general":
+            cursor.execute("""
+                SELECT id FROM user_tasks
+                WHERE user_id = ? AND lower(title) = lower(?) AND completed = 0 AND (workspace = 'General' OR workspace = ?)
+            """, (user_id, raw_title, target_ws_id))
+        elif is_name_unique:
+            cursor.execute("""
+                SELECT id FROM user_tasks
+                WHERE user_id = ? AND lower(title) = lower(?) AND completed = 0 AND (workspace = ? OR workspace = ?)
+            """, (user_id, raw_title, target_ws_id, target_ws_name))
+        else:
+            cursor.execute("""
+                SELECT id FROM user_tasks
+                WHERE user_id = ? AND lower(title) = lower(?) AND completed = 0 AND workspace = ?
+            """, (user_id, raw_title, target_ws_id))
         dup = cursor.fetchone()
         if dup:
             conn.close()
             result["tool_executed"] = "create_task"
             result["policy_decision"] = "Duplicate Check: Prevented Duplicate"
-            result["text"] = f"A pending task named '{raw_title}' already exists in `{ws_name}` (ID: `{dup['id']}`). No duplicate was created."
+            result["text"] = f"A pending task named '{raw_title}' already exists in `{target_ws_name}` (ID: `{dup['id']}`). No duplicate was created."
             return result
 
-        task_id = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{os.urandom(2).hex()}"
+        task_id = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
         cursor.execute("""
             INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
             VALUES (?, ?, ?, 'Chat Assistant', ?, ?, ?, 0, ?, ?)
-        """, (task_id, user_id, raw_title, params.get("source_email_id"), due_date, priority, ws_name, datetime.now(timezone.utc).isoformat()))
+        """, (task_id, user_id, raw_title, params.get("source_email_id"), due_date, priority, target_ws_id, datetime.now(timezone.utc).isoformat()))
 
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Create Task: {raw_title}", latency_ms, f"Created task in {ws_name}", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Create Task: {raw_title}", latency_ms, f"Created task in {target_ws_name}", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
         result["tool_executed"] = "create_task"
         result["policy_decision"] = "Allowed & Executed"
-        result["text"] = f"Your assignment task '{raw_title}' has been created with a due date of {due_date} in workspace `{ws_name}`."
+        result["text"] = f"Your assignment task '{raw_title}' has been created with a due date of {due_date} in workspace `{target_ws_name}`."
         return result
 
     if tool_name == "complete_task":
@@ -1182,7 +1467,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Complete Task: {t_row['title']}", latency_ms, "Marked as completed", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Complete Task: {t_row['title']}", latency_ms, "Marked as completed", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
@@ -1240,7 +1525,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, 'Read Calendar Schedule', 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, latency_ms, f"Found {len(evts)} events", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, latency_ms, f"Found {len(evts)} events", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
@@ -1279,7 +1564,7 @@ async def execute_policy_gate_and_tools(
         description = params.get("description", "Scheduled block")
 
         # Mandatory conflict detection check: Never silently overwrite!
-        conflicts = detect_calendar_conflicts(user_id, event_date, start_time, end_time)
+        conflicts = detect_calendar_conflicts(user_id, event_date, start_time, end_time, cursor=cursor)
         if conflicts:
             c = conflicts[0]
             conn.close()
@@ -1288,7 +1573,7 @@ async def execute_policy_gate_and_tools(
             result["text"] = f"I found a conflict with your existing '{c['title']}' from {c['start_time']} to {c['end_time']} on {event_date}. No event was created. Please choose an alternate time."
             return result
 
-        event_id = f"evt_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        event_id = f"evt_{uuid.uuid4().hex}"
         cursor.execute("""
             INSERT INTO user_calendar_events (id, user_id, workspace_id, title, event_date, start_time, end_time, category, description, source, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Chat Assistant', ?)
@@ -1297,7 +1582,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}", user_id, f"Schedule Event: {title}", latency_ms, f"Scheduled for {event_date}", datetime.now(timezone.utc).isoformat()))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Schedule Event: {title}", latency_ms, f"Scheduled for {event_date}", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
@@ -1357,7 +1642,7 @@ async def execute_policy_gate_and_tools(
         updated_start = new_start or evt["start_time"]
         updated_end = new_end or evt["end_time"]
 
-        conflicts = [c for c in detect_calendar_conflicts(user_id, updated_date, updated_start, updated_end) if c["id"] != event_id]
+        conflicts = [c for c in detect_calendar_conflicts(user_id, updated_date, updated_start, updated_end, cursor=cursor) if c["id"] != event_id]
         if conflicts:
             c = conflicts[0]
             conn.close()
@@ -1367,7 +1652,7 @@ async def execute_policy_gate_and_tools(
             return result
 
         # Mandatory human approval for calendar modification
-        approval_id = f"appr_cal_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        approval_id = f"appr_cal_{uuid.uuid4().hex}"
         draft_payload = json.dumps({
             "action": "update_calendar_event",
             "event_id": event_id,
@@ -1387,7 +1672,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}", user_id, f"Propose Reschedule: {evt['title']}", latency_ms, f"Queued approval {approval_id}", now_iso))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Propose Reschedule: {evt['title']}", latency_ms, f"Queued approval {approval_id}", now_iso))
         conn.commit()
         conn.close()
 
@@ -1445,7 +1730,7 @@ async def execute_policy_gate_and_tools(
         event_id = evt["id"]
 
         # Mandatory human approval for calendar deletion
-        approval_id = f"appr_cal_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        approval_id = f"appr_cal_{uuid.uuid4().hex}"
         draft_payload = json.dumps({
             "action": "delete_calendar_event",
             "event_id": event_id,
@@ -1462,7 +1747,7 @@ async def execute_policy_gate_and_tools(
         cursor.execute("""
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', ?, ?, ?)
-        """, (f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}", user_id, f"Propose Delete: {evt['title']}", latency_ms, f"Queued approval {approval_id}", now_iso))
+        """, (f"act_{uuid.uuid4().hex}", user_id, f"Propose Delete: {evt['title']}", latency_ms, f"Queued approval {approval_id}", now_iso))
         conn.commit()
         conn.close()
 
@@ -1530,7 +1815,7 @@ async def execute_policy_gate_and_tools(
                     "workspace": ws_name,
                     "source_email_id": msg_id,
                 }
-                approval_id = f"appr_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+                approval_id = f"appr_{uuid.uuid4().hex}"
                 sender_name = m.get("senderName", "Email")
                 cursor.execute("""
                     INSERT INTO user_approvals (id, user_id, type, target, subject, reason, risk_level, draft_content, status, created_at)
@@ -1551,7 +1836,7 @@ async def execute_policy_gate_and_tools(
                 INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
                 VALUES (?, ?, 'Extract Email Deadlines', 'Completed', ?, ?, ?)
             """, (
-                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                f"act_{uuid.uuid4().hex}",
                 user_id,
                 latency_ms,
                 f"Queued {len(proposals_queued)} task proposals from emails",
@@ -1591,7 +1876,7 @@ async def execute_policy_gate_and_tools(
         # If manual transcript was supplied
         if manual_transcript:
             topics = parse_youtube_transcript_text(manual_transcript)
-            note_id = f"not_yt_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+            note_id = f"not_yt_{uuid.uuid4().hex}"
             note_title = f"Lecture Notes: {url[:30]}"
             note_content = json.dumps({"url": url, "topics": topics})
 
@@ -1622,17 +1907,64 @@ async def execute_policy_gate_and_tools(
         exam_date_raw = params.get("exam_date", "December 15")
         exam_date = parse_relative_date(exam_date_raw)
 
+        target_ws_id = ws_canonical_id
+        target_ws_name = ws_name
+        req_ws = params.get("workspace")
+        if req_ws and str(req_ws).strip():
+            cid, name, err = resolve_agent_workspace(cursor, user_id, req_ws)
+            if err == "cross_user":
+                conn.close()
+                result["tool_executed"] = "create_revision_plan"
+                result["policy_decision"] = "Refused: Access denied to workspace"
+                result["text"] = "Security Refusal: Access denied to workspace."
+                return result
+            elif err == "ambiguous":
+                conn.close()
+                result["tool_executed"] = "create_revision_plan"
+                result["policy_decision"] = "Refused: Ambiguous workspace name"
+                result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{req_ws}'. Please specify the exact workspace ID."
+                return result
+            elif err == "not_found":
+                conn.close()
+                result["tool_executed"] = "create_revision_plan"
+                result["policy_decision"] = "Refused: Workspace not found"
+                result["text"] = f"Workspace '{req_ws}' not found."
+                return result
+            elif cid:
+                target_ws_id = cid
+                target_ws_name = name
+
+        is_name_unique = False
+        if target_ws_name and target_ws_name.lower() != "general":
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+                (user_id, target_ws_name)
+            )
+            cnt_row = cursor.fetchone()
+            is_name_unique = (cnt_row["count"] if cnt_row else 0) == 1
+
         # Retrieve workspace notes & materials
-        cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND workspace_id = ?", (user_id, workspace_id or "General"))
-        w_notes = cursor.fetchall()
-        cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND workspace_id = ?", (user_id, workspace_id or "General"))
-        w_materials = cursor.fetchall()
+        if target_ws_name.lower() == "general":
+            cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND (workspace_id = 'General' OR workspace_id = ?)", (user_id, target_ws_id))
+            w_notes = cursor.fetchall()
+            cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND (workspace_id = 'General' OR workspace_id = ?)", (user_id, target_ws_id))
+            w_materials = cursor.fetchall()
+        elif is_name_unique:
+            cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND (workspace_id = ? OR workspace_id = ?)", (user_id, target_ws_id, target_ws_name))
+            w_notes = cursor.fetchall()
+            cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND (workspace_id = ? OR workspace_id = ?)", (user_id, target_ws_id, target_ws_name))
+            w_materials = cursor.fetchall()
+        else:
+            cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND workspace_id = ?", (user_id, target_ws_id))
+            w_notes = cursor.fetchall()
+            cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND workspace_id = ?", (user_id, target_ws_id))
+            w_materials = cursor.fetchall()
 
         if not w_notes and not w_materials:
             conn.close()
             result["tool_executed"] = "create_revision_plan"
             result["policy_decision"] = "No Study Materials Found"
-            result["text"] = "I couldn't find any uploaded study materials or notes in this workspace. Upload your notes or paste your lecture content to create a revision plan."
+            result["text"] = f"I couldn't find any uploaded study materials or notes in workspace `{target_ws_name}`. Upload your notes or paste your lecture content to create a revision plan."
             return result
 
         # Extract topics strictly from uploaded text
@@ -1658,28 +1990,90 @@ async def execute_policy_gate_and_tools(
                 "completed": False
             })
 
-        plan_id = f"plan_{int(time.time()*1000)}"
+        plan_id = f"plan_{uuid.uuid4().hex[:12]}"
         cursor.execute("""
             INSERT OR REPLACE INTO user_revision_plans (id, user_id, workspace_id, exam_date, plan_json, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (plan_id, user_id, workspace_id or "General", exam_date, json.dumps(plan_sessions), datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()))
+        """, (plan_id, user_id, target_ws_id, exam_date, json.dumps(plan_sessions), datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 
         result["tool_executed"] = "create_revision_plan"
         result["policy_decision"] = "Allowed & Executed"
         plan_str = "\n".join([f"- **Session {s['session_number']}** ({s['date']}): {s['topic']}" for s in plan_sessions])
-        result["text"] = f"### Exam Revision Plan (Target Date: {exam_date}):\n\n{plan_str}\n\n*Would you like me to convert these revision sessions into tasks or calendar blocks?*"
+        result["text"] = f"### Exam Revision Plan for `{target_ws_name}` (Target Date: {exam_date}):\n\n{plan_str}\n\n*Would you like me to convert these revision sessions into tasks or calendar blocks?*"
         return result
 
     if tool_name == "convert_plan_to_tasks":
-        cursor.execute("SELECT plan_json FROM user_revision_plans WHERE user_id = ? AND workspace_id = ? ORDER BY created_at DESC LIMIT 1", (user_id, workspace_id or "General"))
+        target_ws_id = ws_canonical_id
+        target_ws_name = ws_name
+        req_ws = params.get("workspace")
+        if req_ws and str(req_ws).strip():
+            cid, name, err = resolve_agent_workspace(cursor, user_id, req_ws)
+            if err == "cross_user":
+                conn.close()
+                result["tool_executed"] = "convert_plan_to_tasks"
+                result["policy_decision"] = "Refused: Access denied to workspace"
+                result["text"] = "Security Refusal: Access denied to workspace."
+                return result
+            elif err == "ambiguous":
+                conn.close()
+                result["tool_executed"] = "convert_plan_to_tasks"
+                result["policy_decision"] = "Refused: Ambiguous workspace name"
+                result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{req_ws}'. Please specify the exact workspace ID."
+                return result
+            elif err == "not_found":
+                conn.close()
+                result["tool_executed"] = "convert_plan_to_tasks"
+                result["policy_decision"] = "Refused: Workspace not found"
+                result["text"] = f"Workspace '{req_ws}' not found."
+                return result
+            elif cid:
+                target_ws_id = cid
+                target_ws_name = name
+
+        is_name_unique = False
+        if target_ws_name and target_ws_name.lower() != "general":
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+                (user_id, target_ws_name)
+            )
+            cnt_row = cursor.fetchone()
+            is_name_unique = (cnt_row["count"] if cnt_row else 0) == 1
+
+        if target_ws_name.lower() == "general":
+            cursor.execute(
+                """
+                SELECT plan_json FROM user_revision_plans
+                WHERE user_id = ? AND (workspace_id = 'General' OR workspace_id = ?)
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id, target_ws_id)
+            )
+        elif is_name_unique:
+            cursor.execute(
+                """
+                SELECT plan_json FROM user_revision_plans
+                WHERE user_id = ? AND (workspace_id = ? OR workspace_id = ?)
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id, target_ws_id, target_ws_name)
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT plan_json FROM user_revision_plans
+                WHERE user_id = ? AND workspace_id = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id, target_ws_id)
+            )
         row = cursor.fetchone()
         if not row:
             conn.close()
             result["tool_executed"] = "convert_plan_to_tasks"
             result["policy_decision"] = "No Revision Plan Found"
-            result["text"] = "No active revision plan found in this workspace. Ask me to create a revision plan first."
+            result["text"] = f"No active revision plan found in workspace `{target_ws_name}`. Ask me to create a revision plan first."
             return result
 
         sessions = json.loads(row["plan_json"])
@@ -1687,16 +2081,30 @@ async def execute_policy_gate_and_tools(
 
         for s in sessions:
             task_title = f"Revision Session: {s['topic']}"
-            # Deduplicate
-            cursor.execute("SELECT id FROM user_tasks WHERE user_id = ? AND lower(title) = lower(?)", (user_id, task_title))
+            # Deduplicate strictly in target workspace
+            if target_ws_name.lower() == "general":
+                cursor.execute(
+                    "SELECT id FROM user_tasks WHERE user_id = ? AND lower(title) = lower(?) AND (workspace = 'General' OR workspace = ?)",
+                    (user_id, task_title, target_ws_id)
+                )
+            elif is_name_unique:
+                cursor.execute(
+                    "SELECT id FROM user_tasks WHERE user_id = ? AND lower(title) = lower(?) AND (workspace = ? OR workspace = ?)",
+                    (user_id, task_title, target_ws_id, target_ws_name)
+                )
+            else:
+                cursor.execute(
+                    "SELECT id FROM user_tasks WHERE user_id = ? AND lower(title) = lower(?) AND workspace = ?",
+                    (user_id, task_title, target_ws_id)
+                )
             if cursor.fetchone():
                 continue
 
-            t_id = f"tsk_rev_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+            t_id = f"tsk_rev_{uuid.uuid4().hex[:12]}"
             cursor.execute("""
                 INSERT INTO user_tasks (id, user_id, title, source, due_date, priority, completed, workspace, created_at)
                 VALUES (?, ?, ?, 'Revision Plan', ?, 'normal', 0, ?, ?)
-            """, (t_id, user_id, task_title, s["date"], ws_name, datetime.now(timezone.utc).isoformat()))
+            """, (t_id, user_id, task_title, s["date"], target_ws_id, datetime.now(timezone.utc).isoformat()))
             tasks_added.append(f"**{task_title}** (Scheduled for: {s['date']})")
 
         conn.commit()
@@ -1705,16 +2113,63 @@ async def execute_policy_gate_and_tools(
         result["tool_executed"] = "convert_plan_to_tasks"
         result["policy_decision"] = "Allowed & Executed"
         if tasks_added:
-            result["text"] = "### Created Revision Tasks:\n" + "\n".join([f"- {t}" for t in tasks_added])
+            result["text"] = f"### Created Revision Tasks in `{target_ws_name}`:\n" + "\n".join([f"- {t}" for t in tasks_added])
         else:
-            result["text"] = "All revision sessions already exist as tasks in this workspace. No duplicates were created."
+            result["text"] = f"All revision sessions already exist as tasks in workspace `{target_ws_name}`. No duplicates were created."
         return result
 
     if tool_name == "generate_quiz_questions":
-        cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND workspace_id = ?", (user_id, workspace_id or "General"))
-        w_notes = cursor.fetchall()
-        cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND workspace_id = ?", (user_id, workspace_id or "General"))
-        w_materials = cursor.fetchall()
+        target_ws_id = ws_canonical_id
+        target_ws_name = ws_name
+        req_ws = params.get("workspace")
+        if req_ws and str(req_ws).strip():
+            cid, name, err = resolve_agent_workspace(cursor, user_id, req_ws)
+            if err == "cross_user":
+                conn.close()
+                result["tool_executed"] = "generate_quiz_questions"
+                result["policy_decision"] = "Refused: Access denied to workspace"
+                result["text"] = "Security Refusal: Access denied to workspace."
+                return result
+            elif err == "ambiguous":
+                conn.close()
+                result["tool_executed"] = "generate_quiz_questions"
+                result["policy_decision"] = "Refused: Ambiguous workspace name"
+                result["text"] = f"Ambiguity Refusal: Multiple workspaces exist with the name '{req_ws}'. Please specify the exact workspace ID."
+                return result
+            elif err == "not_found":
+                conn.close()
+                result["tool_executed"] = "generate_quiz_questions"
+                result["policy_decision"] = "Refused: Workspace not found"
+                result["text"] = f"Workspace '{req_ws}' not found."
+                return result
+            elif cid:
+                target_ws_id = cid
+                target_ws_name = name
+
+        is_name_unique = False
+        if target_ws_name and target_ws_name.lower() != "general":
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+                (user_id, target_ws_name)
+            )
+            cnt_row = cursor.fetchone()
+            is_name_unique = (cnt_row["count"] if cnt_row else 0) == 1
+
+        if target_ws_name.lower() == "general":
+            cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND (workspace_id = 'General' OR workspace_id = ?)", (user_id, target_ws_id))
+            w_notes = cursor.fetchall()
+            cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND (workspace_id = 'General' OR workspace_id = ?)", (user_id, target_ws_id))
+            w_materials = cursor.fetchall()
+        elif is_name_unique:
+            cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND (workspace_id = ? OR workspace_id = ?)", (user_id, target_ws_id, target_ws_name))
+            w_notes = cursor.fetchall()
+            cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND (workspace_id = ? OR workspace_id = ?)", (user_id, target_ws_id, target_ws_name))
+            w_materials = cursor.fetchall()
+        else:
+            cursor.execute("SELECT title, content FROM user_workspace_notes WHERE user_id = ? AND workspace_id = ?", (user_id, target_ws_id))
+            w_notes = cursor.fetchall()
+            cursor.execute("SELECT filename, content_text FROM user_study_materials WHERE user_id = ? AND workspace_id = ?", (user_id, target_ws_id))
+            w_materials = cursor.fetchall()
 
         if not w_notes and not w_materials:
             conn.close()

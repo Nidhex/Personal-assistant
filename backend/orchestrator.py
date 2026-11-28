@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import uuid
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
@@ -10,6 +11,21 @@ from zoneinfo import ZoneInfo
 from .database import get_db
 from .google_service import fetch_gmail_messages
 from .agent import detect_calendar_conflicts, parse_relative_date, parse_time_to_minutes
+
+def parse_and_validate_time(time_str: Any) -> Optional[tuple[int, int]]:
+    """
+    Validates and parses a 24-hour zero-padded 'HH:MM' time string.
+    Returns (hour, minute) as integers if valid, or None if invalid.
+    Strictly accepts '00:00' to '23:59'.
+    Strictly rejects '8:00', '24:00', '25:00', '12:90', empty strings, and non-strings.
+    """
+    if not time_str or not isinstance(time_str, str):
+        return None
+    time_str = time_str.strip()
+    match = re.fullmatch(r"^([0-1][0-9]|2[0-3]):([0-5][0-9])$", time_str)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
 
 # Active run locks in memory to prevent concurrent / overlapping runs per user
 _ACTIVE_USER_RUNS = set()
@@ -136,14 +152,20 @@ def update_user_settings(user_id: str, settings: Dict[str, Any]) -> SettingsDict
         async def _update_d1():
             current = await get_or_create_user_settings(user_id)
             enabled = int(bool(settings.get("daily_run_enabled", current.get("daily_run_enabled", 0))))
-            pref_time = settings.get("preferred_time", current.get("preferred_time", "08:00"))
+            if "preferred_time" in settings and settings["preferred_time"] is not None:
+                pref_raw = settings["preferred_time"]
+                if parse_and_validate_time(pref_raw) is None:
+                    raise ValueError(f"Invalid preferred_time format: {pref_raw!r}. Expected zero-padded 24-hour HH:MM (00:00 to 23:59).")
+                pref_time = pref_raw.strip()
+            else:
+                pref_time = current.get("preferred_time", "08:00")
+
             tz_str = settings.get("timezone", current.get("timezone", "UTC"))
             try:
                 ZoneInfo(tz_str)
             except Exception:
                 tz_str = "UTC"
-            if not re.match(r"^\d{1,2}:\d{2}$", pref_time):
-                pref_time = "08:00"
+
             sources = settings.get("permitted_sources", current.get("permitted_sources", ["gmail", "tasks", "calendar"]))
             sources_json = json.dumps(sources) if isinstance(sources, list) else json.dumps(["gmail", "tasks", "calendar"])
             kill_switch = int(bool(settings.get("kill_switch_enabled", current.get("kill_switch_enabled", 0))))
@@ -163,7 +185,14 @@ def update_user_settings(user_id: str, settings: Dict[str, Any]) -> SettingsDict
 
     current = get_or_create_user_settings(user_id)
     enabled = int(bool(settings.get("daily_run_enabled", current["daily_run_enabled"])))
-    pref_time = settings.get("preferred_time", current["preferred_time"])
+    if "preferred_time" in settings and settings["preferred_time"] is not None:
+        pref_raw = settings["preferred_time"]
+        if parse_and_validate_time(pref_raw) is None:
+            raise ValueError(f"Invalid preferred_time format: {pref_raw!r}. Expected zero-padded 24-hour HH:MM (00:00 to 23:59).")
+        pref_time = pref_raw.strip()
+    else:
+        pref_time = current.get("preferred_time", "08:00")
+
     tz_str = settings.get("timezone", current["timezone"])
     
     # Validate timezone
@@ -171,10 +200,6 @@ def update_user_settings(user_id: str, settings: Dict[str, Any]) -> SettingsDict
         ZoneInfo(tz_str)
     except Exception:
         tz_str = "UTC"
-
-    # Validate preferred time format (HH:MM)
-    if not re.match(r"^\d{1,2}:\d{2}$", pref_time):
-        pref_time = "08:00"
 
     sources = settings.get("permitted_sources", current["permitted_sources"])
     sources_json = json.dumps(sources) if isinstance(sources, list) else json.dumps(["gmail", "tasks", "calendar"])
@@ -197,18 +222,21 @@ def update_user_settings(user_id: str, settings: Dict[str, Any]) -> SettingsDict
 
     return get_or_create_user_settings(user_id)
 
-def calculate_next_run(preferred_time: str, tz_name: str) -> str:
+def calculate_next_run(preferred_time: str, tz_name: str) -> Optional[str]:
     """Calculates ISO timestamp of next scheduled run in user's timezone."""
+    pref_parsed = parse_and_validate_time(preferred_time)
+    if pref_parsed is None:
+        import logging
+        logging.getLogger(__name__).warning("Cannot calculate next run: malformed preferred_time %r", preferred_time)
+        return None
+
+    target_hour, target_min = pref_parsed
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
 
     now_local = datetime.now(tz)
-    parts = preferred_time.split(":")
-    target_hour = int(parts[0])
-    target_min = int(parts[1])
-
     scheduled_today = now_local.replace(hour=target_hour, minute=target_min, second=0, microsecond=0)
     if scheduled_today <= now_local:
         scheduled_next = scheduled_today + timedelta(days=1)
@@ -234,13 +262,12 @@ def log_run_step(
     latency_ms: str = "0ms"
 ):
     """Appends an immutable audit step to agent_run_steps and user_activity."""
-    step_id = f"step_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    step_id = f"step_{uuid.uuid4().hex}"
     now_str = datetime.now(timezone.utc).isoformat()
     params_str = json.dumps(tool_parameters) if tool_parameters else None
 
     import logging
     import sqlite3
-    import uuid
     logger = logging.getLogger(__name__)
 
     conn = get_db()
@@ -312,7 +339,7 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
 
     _ACTIVE_USER_RUNS.add(user_id)
     start_time = time.time()
-    run_id = f"run_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    run_id = f"run_{uuid.uuid4().hex}"
     now_utc = datetime.now(timezone.utc)
     now_str = now_utc.isoformat()
 
@@ -447,7 +474,7 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
                 if not existing_t:
                     task_title = f"Review: {subject[:45]}"
                     due_date = parse_relative_date("tomorrow" if "tomorrow" in full_text else "today")
-                    new_task_id = f"tsk_auto_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+                    new_task_id = f"tsk_auto_{uuid.uuid4().hex[:12]}"
 
                     cursor.execute("""
                         INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
@@ -471,7 +498,7 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
             if "please reply" in full_text or "need your response" in full_text or "rsvp" in full_text:
                 curr_settings = get_or_create_user_settings(user_id)
                 if not curr_settings.get("kill_switch_enabled"):
-                    appr_id = f"appr_auto_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+                    appr_id = f"appr_auto_{uuid.uuid4().hex}"
                     draft_body = f"Hello {msg.get('senderName', '')},\n\nI have received your email regarding '{subject}'. I am reviewing it and will follow up shortly.\n\nBest regards,\n{msg.get('senderName', 'User')}"
 
                     conn = get_db()
@@ -583,7 +610,7 @@ async def execute_daily_run(user_id: str, trigger_type: str = "manual") -> Dict[
             }
         }
 
-        digest_id = f"dig_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+        digest_id = f"dig_{uuid.uuid4().hex[:12]}"
         conn = get_db()
         conn.execute("""
             INSERT INTO daily_digests (id, user_id, run_id, digest_date, title, content_json, created_at)

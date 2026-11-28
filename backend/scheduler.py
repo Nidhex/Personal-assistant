@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
 
 from .database import get_db
-from .orchestrator import execute_daily_run, calculate_next_run
+from .orchestrator import execute_daily_run, calculate_next_run, parse_and_validate_time
 
 logger = logging.getLogger("scheduler")
 
@@ -30,12 +30,21 @@ def is_due_for_run(user_settings: Dict[str, Any], now_utc: Optional[datetime] = 
     now_utc = now_utc or datetime.now(timezone.utc)
     now_local = now_utc.astimezone(user_tz)
     today_str = now_local.strftime("%Y-%m-%d")
-    current_hm = now_local.strftime("%H:%M")
 
-    pref_time = user_settings.get("preferred_time", "08:00")
+    pref_parsed = parse_and_validate_time(user_settings.get("preferred_time"))
+    if pref_parsed is None:
+        logger.warning(
+            "Malformed preferred_time for user %s: %r. Skipping run safely.",
+            user_settings.get("user_id"),
+            user_settings.get("preferred_time")
+        )
+        return False
 
-    # Has preferred time arrived today in user's timezone?
-    if current_hm < pref_time:
+    pref_hour, pref_min = pref_parsed
+    now_local_time = (now_local.hour, now_local.minute)
+
+    # Has preferred time arrived today in user's timezone? (safe numerical comparison)
+    if now_local_time < (pref_hour, pref_min):
         return False
 
     # Check if already executed on today's local date

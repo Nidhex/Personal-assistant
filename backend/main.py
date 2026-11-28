@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import uuid
 import contextvars
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any
@@ -13,7 +14,7 @@ from dotenv import load_dotenv
 
 from .database import init_db, get_db
 from .scheduler import scheduler
-from .orchestrator import get_or_create_user_settings, update_user_settings, execute_daily_run
+from .orchestrator import get_or_create_user_settings, update_user_settings, execute_daily_run, parse_and_validate_time
 from .security import (
     generate_session_id,
     generate_oauth_state,
@@ -913,6 +914,34 @@ class UpdateTaskRequest(BaseModel):
     workspace: Optional[str] = None
     completed: Optional[bool] = None
 
+def resolve_canonical_workspace_id(conn, user_id: str, workspace_ref: Optional[str]) -> Optional[str]:
+    """
+    Resolves a workspace reference (ID or name) to a verified canonical workspace ID
+    belonging to the user.
+    """
+    if not workspace_ref or not str(workspace_ref).strip():
+        return None
+
+    ref = str(workspace_ref).strip()
+    cursor = conn.cursor()
+    from .agent import resolve_agent_workspace
+    cid, name, err = resolve_agent_workspace(cursor, user_id, ref)
+    if err == "cross_user":
+        raise HTTPException(status_code=403, detail="Access denied to workspace.")
+    if err == "ambiguous":
+        raise HTTPException(status_code=400, detail="Ambiguous workspace reference: multiple workspaces share this name.")
+    if cid:
+        return cid
+
+    if ref.lower() == "general":
+        return _resolve_general_workspace_id(conn, user_id)
+
+    if ref.lower().startswith("ws_"):
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+
+    # Preserve unassociated label (e.g. for ad-hoc category test cases)
+    return ref
+
 @app.post("/api/user/tasks")
 def create_task(req: CreateTaskRequest, user: dict = Depends(get_current_user)):
     clean_title = req.title.strip() if req.title else ""
@@ -921,41 +950,45 @@ def create_task(req: CreateTaskRequest, user: dict = Depends(get_current_user)):
 
     task_id = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{os.urandom(2).hex()}"
     conn = get_db()
-    conn.execute("""
-        INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-    """, (task_id, user["id"], clean_title, req.source, req.source_email_id, req.due_date, req.priority, req.workspace, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
+    try:
+        canonical_ws = resolve_canonical_workspace_id(conn, user["id"], req.workspace)
+        conn.execute("""
+            INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        """, (task_id, user["id"], clean_title, req.source, req.source_email_id, req.due_date, req.priority, canonical_ws, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
     return {"success": True, "id": task_id, "title": clean_title}
 
 @app.put("/api/user/tasks/{task_id}")
 def update_task_endpoint(task_id: str, req: UpdateTaskRequest, user: dict = Depends(get_current_user)):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, title, source, due_date, priority, workspace, completed 
-        FROM user_tasks WHERE id = ? AND user_id = ?
-    """, (task_id, user["id"]))
-    row = cursor.fetchone()
-    if not row:
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, title, source, due_date, priority, workspace, completed
+            FROM user_tasks WHERE id = ? AND user_id = ?
+        """, (task_id, user["id"]))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found.")
+
+        new_title = req.title.strip() if req.title is not None and req.title.strip() else row["title"]
+        new_source = req.source if req.source is not None else row["source"]
+        new_due = req.due_date if req.due_date is not None else row["due_date"]
+        new_priority = req.priority if req.priority is not None else row["priority"]
+        new_workspace = resolve_canonical_workspace_id(conn, user["id"], req.workspace) if req.workspace is not None else row["workspace"]
+        new_completed = int(req.completed) if req.completed is not None else row["completed"]
+
+        cursor.execute("""
+            UPDATE user_tasks
+            SET title = ?, source = ?, due_date = ?, priority = ?, workspace = ?, completed = ?
+            WHERE id = ? AND user_id = ?
+        """, (new_title, new_source, new_due, new_priority, new_workspace, new_completed, task_id, user["id"]))
+        conn.commit()
+    finally:
         conn.close()
-        raise HTTPException(status_code=404, detail="Task not found.")
-
-    new_title = req.title.strip() if req.title is not None and req.title.strip() else row["title"]
-    new_source = req.source if req.source is not None else row["source"]
-    new_due = req.due_date if req.due_date is not None else row["due_date"]
-    new_priority = req.priority if req.priority is not None else row["priority"]
-    new_workspace = req.workspace if req.workspace is not None else row["workspace"]
-    new_completed = int(req.completed) if req.completed is not None else row["completed"]
-
-    cursor.execute("""
-        UPDATE user_tasks 
-        SET title = ?, source = ?, due_date = ?, priority = ?, workspace = ?, completed = ?
-        WHERE id = ? AND user_id = ?
-    """, (new_title, new_source, new_due, new_priority, new_workspace, new_completed, task_id, user["id"]))
-    conn.commit()
-    conn.close()
     return {
         "success": True,
         "task": {
@@ -1117,7 +1150,7 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
                 INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
                 VALUES (?, ?, ?, 'Blocked', '0ms', ?, ?)
             """, (
-                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                f"act_{uuid.uuid4().hex}",
                 user["id"],
                 f"Approval: {approval_id}",
                 f"User rejected {approval_type}: {row['subject']}",
@@ -1144,37 +1177,42 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
         # First time winning execution: execute only the approved action
         # 1. Task Proposal
         if approval_type == "Task Proposal":
-            task_id = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{os.urandom(2).hex()}"
-            cursor.execute("""
-                INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
-                VALUES (?, ?, ?, 'Agent Proposal', ?, ?, ?, 0, ?, ?)
-            """, (
-                task_id,
-                user["id"],
-                payload.get("title") or "Proposed Task",
-                payload.get("source_email_id"),
-                payload.get("due_date") or "Today",
-                payload.get("priority") or "normal",
-                payload.get("workspace") or "General",
-                now_iso
-            ))
-            cursor.execute("""
-                INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
-                VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
-            """, (
-                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
-                user["id"],
-                f"Approval: {approval_id}",
-                "Approval completed: task created",
-                now_iso
-            ))
-            conn.commit()
+            raw_ws = payload.get("workspace")
+            try:
+                canonical_ws = resolve_canonical_workspace_id(conn, user["id"], raw_ws) or "General"
+                task_id = f"tsk_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                cursor.execute("""
+                    INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at)
+                    VALUES (?, ?, ?, 'Agent Proposal', ?, ?, ?, 0, ?, ?)
+                """, (
+                    task_id,
+                    user["id"],
+                    payload.get("title") or "Proposed Task",
+                    payload.get("source_email_id"),
+                    payload.get("due_date") or "Today",
+                    payload.get("priority") or "normal",
+                    canonical_ws,
+                    now_iso
+                ))
+                cursor.execute("""
+                    INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
+                    VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
+                """, (
+                    f"act_{uuid.uuid4().hex}",
+                    user["id"],
+                    f"Approval: {approval_id}",
+                    "Approval completed: task created",
+                    now_iso
+                ))
+                conn.commit()
+            except Exception:
+                conn.close()
+                raise
             conn.close()
             return {"success": True, "status": "approved", "created_task_id": task_id}
 
         # 1.5 Email Draft -> Create Gmail draft (idempotent, never sends)
         if approval_type == "Email Draft":
-            import uuid
             from .google_service import create_gmail_draft
             draft_id = row["gmail_draft_id"]
             if not draft_id:
@@ -1231,7 +1269,7 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
                     INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
                     VALUES (?, ?, ?, 'Failed', '0ms', ?, ?)
                 """, (
-                    f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                    f"act_{uuid.uuid4().hex}",
                     user["id"],
                     f"Approval: {approval_id}",
                     "Target calendar event was not found or already deleted. Deletion aborted.",
@@ -1247,7 +1285,7 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
                 INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
                 VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
             """, (
-                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                f"act_{uuid.uuid4().hex}",
                 user["id"],
                 f"Approval: {approval_id}",
                 f"Deleted calendar event: {cal_row['title']}",
@@ -1272,7 +1310,7 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
                     INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
                     VALUES (?, ?, ?, 'Failed', '0ms', ?, ?)
                 """, (
-                    f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                    f"act_{uuid.uuid4().hex}",
                     user["id"],
                     f"Approval: {approval_id}",
                     "Target calendar event was not found. Update aborted.",
@@ -1288,7 +1326,7 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
 
             # Revalidate conflicts before execution
             from .agent import detect_calendar_conflicts
-            conflicts = [c for c in detect_calendar_conflicts(user["id"], updated_date, updated_start, updated_end) if c["id"] != event_id]
+            conflicts = [c for c in detect_calendar_conflicts(user["id"], updated_date, updated_start, updated_end, cursor=cursor) if c["id"] != event_id]
             if conflicts:
                 c = conflicts[0]
                 conn.close()
@@ -1303,7 +1341,7 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
                 INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
                 VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
             """, (
-                f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+                f"act_{uuid.uuid4().hex}",
                 user["id"],
                 f"Approval: {approval_id}",
                 f"Rescheduled calendar event: {cal_row['title']} to {updated_date} ({updated_start} - {updated_end})",
@@ -1318,7 +1356,7 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
             INSERT INTO user_activity (id, user_id, trigger, status, latency, result, created_at)
             VALUES (?, ?, ?, 'Completed', '0ms', ?, ?)
         """, (
-            f"act_{int(time.time()*1000)}_{os.urandom(2).hex()}",
+            f"act_{uuid.uuid4().hex}",
             user["id"],
             f"Approval: {approval_id}",
             f"Approved action: {approval_type}",
@@ -1330,7 +1368,6 @@ async def handle_approval_action(approval_id: str, req: ApprovalActionRequest, u
 
     # Already processed / concurrent duplicate / idempotent retry:
     if req.action == "approve" and approval_type == "Email Draft" and row["gmail_draft_id"] == "creating":
-        import uuid
         from .google_service import reconcile_gmail_draft
         reconciled_id = await reconcile_gmail_draft(
             user["id"],
@@ -1413,7 +1450,7 @@ def create_conversation(
     user: dict = Depends(get_current_user)
 ):
     """Creates a persistent conversation for the user, linked to an optional workspace."""
-    conv_id = f"conv_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    conv_id = f"conv_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
     now_str = datetime.now(timezone.utc).isoformat()
     ws_id = req.workspace_id if req.workspace_id and req.workspace_id != "main" else None
 
@@ -1499,7 +1536,7 @@ async def send_chat_message(
 
     workspace_id = conv["workspace_id"]
     now_str = datetime.now(timezone.utc).isoformat()
-    user_msg_id = f"msg_{int(time.time()*1000)}_u"
+    user_msg_id = f"msg_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}_u"
 
     # Save user message
     cursor.execute("""
@@ -1527,7 +1564,7 @@ async def send_chat_message(
         kill_switch_active=authoritative_kill_switch
     )
 
-    assistant_msg_id = f"msg_{int(time.time()*1000)}_a"
+    assistant_msg_id = f"msg_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}_a"
     asst_now = datetime.now(timezone.utc).isoformat()
     metadata_json = json.dumps({
         "policy_decision": execution_result["policy_decision"],
@@ -1634,7 +1671,7 @@ def add_workspace_note(
     if not req.title.strip():
         raise HTTPException(status_code=400, detail="Note title cannot be empty.")
 
-    note_id = f"not_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    note_id = f"not_{uuid.uuid4().hex[:12]}"
     now_str = datetime.now(timezone.utc).isoformat()
     clean_title = req.title.strip()
     clean_content = req.content.strip()
@@ -1769,7 +1806,7 @@ async def create_youtube_notes(
 
     topics = build_timestamp_sections(transcript["snippets"])
     now_str = datetime.now(timezone.utc).isoformat()
-    note_id = f"not_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    note_id = f"not_{uuid.uuid4().hex[:12]}"
     note_title = f"YouTube Notes: {video_id}"
     note_payload = {
         "video_url": req.url.strip(),
@@ -1864,7 +1901,7 @@ def create_calendar_event(
                 detail=f"Calendar conflict with existing event '{conflicts[0]['title']}' ({conflicts[0]['start_time']} - {conflicts[0]['end_time']})."
             )
 
-    event_id = f"evt_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    event_id = f"evt_{uuid.uuid4().hex[:12]}"
     conn = get_db()
     conn.execute("""
         INSERT INTO user_calendar_events (id, user_id, workspace_id, title, event_date, start_time, end_time, category, description, source, created_at)
@@ -1913,7 +1950,7 @@ def update_calendar_event(
 
     from .agent import detect_calendar_conflicts
     if not req.force:
-        conflicts = [c for c in detect_calendar_conflicts(user["id"], new_date, new_start, new_end) if c["id"] != event_id]
+        conflicts = [c for c in detect_calendar_conflicts(user["id"], new_date, new_start, new_end, cursor=cursor) if c["id"] != event_id]
         if conflicts:
             conn.close()
             raise HTTPException(
@@ -1987,7 +2024,7 @@ def upload_study_material(
     req: UploadStudyMaterialRequest,
     user: dict = Depends(get_current_user)
 ):
-    mat_id = f"mat_{int(time.time()*1000)}_{os.urandom(2).hex()}"
+    mat_id = f"mat_{uuid.uuid4().hex[:12]}"
     conn = get_db()
     conn.execute("""
         INSERT INTO user_study_materials (id, user_id, workspace_id, filename, content_text, created_at)
@@ -2004,11 +2041,55 @@ def get_revision_plan(
 ):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, workspace_id, exam_date, plan_json, created_at, updated_at
-        FROM user_revision_plans WHERE workspace_id = ? AND user_id = ?
-        ORDER BY created_at DESC LIMIT 1
-    """, (workspace_id, user["id"]))
+
+    ws_id = str(workspace_id).strip()
+    if ws_id.lower() in ("general", "main"):
+        cursor.execute("""
+            SELECT id, workspace_id, exam_date, plan_json, created_at, updated_at
+            FROM user_revision_plans WHERE user_id = ? AND (workspace_id = 'General' OR workspace_id = 'main')
+            ORDER BY created_at DESC LIMIT 1
+        """, (user["id"],))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return {"plan": None}
+        d = dict(row)
+        d["sessions"] = json.loads(d["plan_json"])
+        return {"plan": d}
+
+    # Verify workspace belongs to user
+    cursor.execute("SELECT id, name FROM user_workspaces WHERE id = ? AND user_id = ?", (ws_id, user["id"]))
+    ws_row = cursor.fetchone()
+    if not ws_row:
+        # Check if ID belongs to another user (cross-user access prevention)
+        cursor.execute("SELECT id FROM user_workspaces WHERE id = ?", (ws_id,))
+        if cursor.fetchone():
+            conn.close()
+            raise HTTPException(status_code=403, detail="Access denied to workspace.")
+        conn.close()
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+
+    # Check if workspace name is unique for this user
+    cursor.execute(
+        "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+        (user["id"], ws_row["name"])
+    )
+    cnt_row = cursor.fetchone()
+    is_name_unique = (cnt_row["count"] or 0) == 1
+
+    if is_name_unique:
+        cursor.execute("""
+            SELECT id, workspace_id, exam_date, plan_json, created_at, updated_at
+            FROM user_revision_plans WHERE user_id = ? AND (workspace_id = ? OR workspace_id = ?)
+            ORDER BY created_at DESC LIMIT 1
+        """, (user["id"], ws_row["id"], ws_row["name"]))
+    else:
+        cursor.execute("""
+            SELECT id, workspace_id, exam_date, plan_json, created_at, updated_at
+            FROM user_revision_plans WHERE user_id = ? AND workspace_id = ?
+            ORDER BY created_at DESC LIMIT 1
+        """, (user["id"], ws_row["id"]))
+
     row = cursor.fetchone()
     conn.close()
     if not row:
@@ -2044,6 +2125,11 @@ async def save_agent_settings(req: UpdateAgentSettingsRequest, user: dict = Depe
     if req.daily_run_enabled is not None:
         payload["daily_run_enabled"] = req.daily_run_enabled
     if req.preferred_time is not None:
+        if parse_and_validate_time(req.preferred_time) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid preferred_time format: '{req.preferred_time}'. Expected zero-padded 24-hour HH:MM format (00:00 to 23:59)."
+            )
         payload["preferred_time"] = req.preferred_time
     if req.timezone is not None:
         payload["timezone"] = req.timezone
@@ -2052,9 +2138,12 @@ async def save_agent_settings(req: UpdateAgentSettingsRequest, user: dict = Depe
     if req.kill_switch_enabled is not None:
         payload["kill_switch_enabled"] = req.kill_switch_enabled
 
-    raw_updated = update_user_settings(user["id"], payload)
-    updated = await raw_updated if hasattr(raw_updated, "__await__") else raw_updated
-    return {"success": True, "settings": updated}
+    try:
+        raw_updated = update_user_settings(user["id"], payload)
+        updated = await raw_updated if hasattr(raw_updated, "__await__") else raw_updated
+        return {"success": True, "settings": updated}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 @app.post("/api/agent/kill-switch")
 async def toggle_kill_switch(req: SetKillSwitchRequest, user: dict = Depends(get_current_user)):
@@ -2214,7 +2303,36 @@ def export_workspace(workspace_id: str, user: dict = Depends(get_current_user)):
         conn.close()
         raise HTTPException(status_code=404, detail="Workspace not found.")
     notes = [dict(r) for r in conn.execute("SELECT title, content, created_at FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ?", (workspace_id, user["id"])).fetchall()]
-    tasks = [dict(r) for r in conn.execute("SELECT title, due_date, priority, completed FROM user_tasks WHERE workspace = ? AND user_id = ?", (ws["name"], user["id"])).fetchall()]
+
+    # Security check: Check if workspace name is unique for this user
+    name_count_row = conn.execute(
+        "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+        (user["id"], ws["name"])
+    ).fetchone()
+    is_name_unique = (name_count_row["count"] or 0) == 1
+
+    if is_name_unique:
+        task_rows = conn.execute(
+            """
+            SELECT title, due_date, priority, completed
+            FROM user_tasks
+            WHERE user_id = ? AND (workspace = ? OR workspace = ?)
+            ORDER BY created_at DESC
+            """,
+            (user["id"], workspace_id, ws["name"])
+        ).fetchall()
+    else:
+        task_rows = conn.execute(
+            """
+            SELECT title, due_date, priority, completed
+            FROM user_tasks
+            WHERE user_id = ? AND workspace = ?
+            ORDER BY created_at DESC
+            """,
+            (user["id"], workspace_id)
+        ).fetchall()
+
+    tasks = [dict(r) for r in task_rows]
     conn.close()
     return {"workspace": dict(ws), "notes": notes, "tasks": tasks}
 
@@ -2248,7 +2366,7 @@ def import_workspace(req: ImportWorkspaceRequest, user: dict = Depends(get_curre
     for t in req.tasks:
         conn.execute(
             "INSERT INTO user_tasks (id, user_id, title, source, source_email_id, due_date, priority, completed, workspace, created_at) VALUES (?, ?, ?, 'Imported', NULL, ?, ?, ?, ?, ?)",
-            (f"tsk_{uuid.uuid4().hex[:12]}", user["id"], t.get("title", "Task"), t.get("due_date", "Today"), t.get("priority", "normal"), 1 if t.get("completed") else 0, ws_name, now_iso),
+            (f"tsk_{uuid.uuid4().hex[:12]}", user["id"], t.get("title", "Task"), t.get("due_date", "Today"), t.get("priority", "normal"), 1 if t.get("completed") else 0, ws_id, now_iso),
         )
     conn.commit()
     conn.close()
@@ -2294,7 +2412,36 @@ def get_shared_workspace(token: str):
         conn.close()
         raise HTTPException(status_code=404, detail="Workspace not found.")
     notes = [dict(r) for r in conn.execute("SELECT id, title, content, created_at FROM user_workspace_notes WHERE workspace_id = ? AND user_id = ?", (share["workspace_id"], share["user_id"])).fetchall()]
-    tasks = [dict(r) for r in conn.execute("SELECT id, title, due_date, priority, completed FROM user_tasks WHERE workspace = ? AND user_id = ?", (ws["name"], share["user_id"])).fetchall()]
+
+    # Security check: Check if workspace name is unique for the owner
+    name_count_row = conn.execute(
+        "SELECT COUNT(*) as count FROM user_workspaces WHERE user_id = ? AND lower(name) = lower(?)",
+        (share["user_id"], ws["name"])
+    ).fetchone()
+    is_name_unique = (name_count_row["count"] or 0) == 1
+
+    if is_name_unique:
+        task_rows = conn.execute(
+            """
+            SELECT id, title, due_date, priority, completed
+            FROM user_tasks
+            WHERE user_id = ? AND (workspace = ? OR workspace = ?)
+            ORDER BY created_at DESC
+            """,
+            (share["user_id"], share["workspace_id"], ws["name"])
+        ).fetchall()
+    else:
+        task_rows = conn.execute(
+            """
+            SELECT id, title, due_date, priority, completed
+            FROM user_tasks
+            WHERE user_id = ? AND workspace = ?
+            ORDER BY created_at DESC
+            """,
+            (share["user_id"], share["workspace_id"])
+        ).fetchall()
+
+    tasks = [dict(r) for r in task_rows]
     conn.close()
     return {"read_only": True, "workspace": dict(ws), "notes": notes, "tasks": tasks}
 

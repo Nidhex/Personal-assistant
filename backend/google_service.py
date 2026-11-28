@@ -14,14 +14,24 @@ from .database import get_db
 async def _client_get(url: str, headers: dict = None, params: dict = None, timeout: float = 15.0):
     if HAS_WORKER_FETCH:
         return await http_get(url, headers=headers, params=params, timeout=timeout)
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         return await client.get(url, headers=headers, params=params, timeout=timeout)
 
-async def _client_post(url: str, data: dict = None, headers: dict = None, timeout: float = 15.0):
+async def _client_post(
+    url: str,
+    data: dict = None,
+    headers: dict = None,
+    timeout: float = 15.0,
+    *,
+    json_data: Any = None,
+    **kwargs
+):
+    if json_data is None and "json" in kwargs:
+        json_data = kwargs["json"]
     if HAS_WORKER_FETCH:
-        return await http_post(url, data=data, headers=headers, timeout=timeout)
-    async with httpx.AsyncClient() as client:
-        return await client.post(url, data=data, headers=headers, timeout=timeout)
+        return await http_post(url, data=data, json_data=json_data, headers=headers, timeout=timeout)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.post(url, data=data, json=json_data, headers=headers, timeout=timeout)
 
 load_dotenv()
 
@@ -538,12 +548,15 @@ async def create_gmail_draft(user_id: str, to: str, subject: str, body: str, app
     msg.set_content(body or "")
     raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(
+    try:
+        resp = await _client_post(
             "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json={"message": {"raw": raw_b64}},
+            json_data={"message": {"raw": raw_b64}},
+            timeout=10.0,
         )
+    except Exception as e:
+        raise RuntimeError(f"Gmail API network error or timeout during draft creation: {type(e).__name__}")
     if resp.status_code == 403:
         raise Exception("Gmail compose permission missing. Please re-authorize Google OAuth to grant gmail.compose.")
     if resp.status_code >= 400:
@@ -585,36 +598,43 @@ async def reconcile_gmail_draft(
     access_token = await get_valid_access_token(user_id)
     if not access_token or not approval_id:
         return None
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        list_resp = await client.get(
+    try:
+        list_resp = await _client_get(
             "https://gmail.googleapis.com/gmail/v1/users/me/drafts?maxResults=20",
             headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10.0,
         )
-        if list_resp.status_code >= 400:
-            return None
-        drafts = list_resp.json().get("drafts", []) or []
-        for d in drafts:
-            did = d.get("id")
-            if not did:
-                continue
-            det_resp = await client.get(
+    except Exception:
+        return None
+    if list_resp.status_code >= 400:
+        return None
+    drafts = list_resp.json().get("drafts", []) or []
+    for d in drafts:
+        did = d.get("id")
+        if not did:
+            continue
+        try:
+            det_resp = await _client_get(
                 f"https://gmail.googleapis.com/gmail/v1/users/me/drafts/{did}?format=full",
                 headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10.0,
             )
-            if det_resp.status_code >= 400:
-                continue
-            det = det_resp.json()
-            payload = det.get("message", {}).get("payload", {}) or {}
-            headers = payload.get("headers", []) or []
-            hmap = {(h.get("name") or "").lower(): (h.get("value") or "") for h in headers}
-            if hmap.get("x-assistant-approval-id") != approval_id:
-                continue
-            body_text = _extract_gmail_body(payload)
-            if (
-                _norm_text(hmap.get("to", "")) == _norm_text(expected_to)
-                and _norm_text(hmap.get("subject", "")) == _norm_text(expected_subject)
-                and _norm_text(body_text) == _norm_text(expected_body)
-            ):
-                return did
-            return None
+        except Exception:
+            continue
+        if det_resp.status_code >= 400:
+            continue
+        det = det_resp.json()
+        payload = det.get("message", {}).get("payload", {}) or {}
+        headers = payload.get("headers", []) or []
+        hmap = {(h.get("name") or "").lower(): (h.get("value") or "") for h in headers}
+        if hmap.get("x-assistant-approval-id") != approval_id:
+            continue
+        body_text = _extract_gmail_body(payload)
+        if (
+            _norm_text(hmap.get("to", "")) == _norm_text(expected_to)
+            and _norm_text(hmap.get("subject", "")) == _norm_text(expected_subject)
+            and _norm_text(body_text) == _norm_text(expected_body)
+        ):
+            return did
+        return None
     return None

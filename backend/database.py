@@ -241,6 +241,56 @@ class D1Cursor:
         return self._last_result.lastrowid if self._last_result else None
 
 
+def _is_worker_context(worker_env=None) -> bool:
+    """
+    Detects whether the application is running within a Cloudflare Worker runtime context.
+    Checks:
+    1. Explicit worker_env parameter passed to function
+    2. Active ContextVar current_worker_env (set by ASGI middleware)
+    3. Process environment flags WORKER_ENV=1 or CF_PAGES=1
+    """
+    if worker_env is not None:
+        return True
+
+    try:
+        from .main import current_worker_env
+        if current_worker_env.get() is not None:
+            return True
+    except Exception:
+        pass
+
+    if os.getenv("WORKER_ENV") == "1" or os.getenv("CF_PAGES") == "1":
+        return True
+
+    return False
+
+
+def _is_production_environment(worker_env=None) -> bool:
+    """
+    Determines whether the application is running in production.
+    Checks explicit worker_env binding, active ContextVar, and process environment variables.
+    """
+    if worker_env is not None:
+        val = getattr(worker_env, "ENVIRONMENT", None) if hasattr(worker_env, "ENVIRONMENT") else (worker_env.get("ENVIRONMENT") if isinstance(worker_env, dict) else None)
+        if val and str(val).strip().lower() == "production":
+            return True
+
+    try:
+        from .main import current_worker_env
+        env = current_worker_env.get()
+        if env is not None:
+            val = getattr(env, "ENVIRONMENT", None) if hasattr(env, "ENVIRONMENT") else (env.get("ENVIRONMENT") if isinstance(env, dict) else None)
+            if val and str(val).strip().lower() == "production":
+                return True
+    except Exception:
+        pass
+
+    if os.getenv("ENVIRONMENT", "").strip().lower() == "production":
+        return True
+
+    return False
+
+
 class CloudflareD1DatabaseAdapter:
     """
     Cloudflare D1 Database Adapter.
@@ -262,15 +312,48 @@ class CloudflareD1DatabaseAdapter:
         self.database_id = database_id or os.getenv("CF_D1_DATABASE_ID")
         self.api_token = api_token or os.getenv("CF_API_TOKEN")
         self.worker_env = worker_env
+        if self.worker_env is None:
+            try:
+                from .main import current_worker_env
+                self.worker_env = current_worker_env.get()
+            except Exception:
+                pass
+
         self.test_mode = test_mode or bool(os.getenv("CF_D1_TEST_MODE", "0") == "1")
-        
-        # Test engine initialization for deterministic verification
+
+        has_worker_binding = bool(self.worker_env and hasattr(self.worker_env, "DB") and getattr(self.worker_env, "DB") is not None)
+        has_rest_credentials = bool(self.account_id and self.database_id and self.api_token)
+        is_worker = _is_worker_context(self.worker_env)
+        in_prod = _is_production_environment(self.worker_env)
+
+        # In Cloudflare Worker or production, missing D1 worker binding and missing valid D1 credentials must fail closed
+        if (is_worker or in_prod) and not has_worker_binding and not has_rest_credentials:
+            raise RuntimeError(
+                "Cloudflare D1 requires an active worker environment with 'DB' binding or valid "
+                "CF_ACCOUNT_ID, CF_D1_DATABASE_ID, and CF_API_TOKEN credentials when running in a Cloudflare Worker or production environment."
+            )
+
+        # Test engine initialization for deterministic verification or local test mode (non-worker, non-prod only)
         self._test_conn: Optional[sqlite3.Connection] = None
-        if self.test_mode or (not self.worker_env and not (self.account_id and self.database_id and self.api_token)):
-            path = test_db_path or ":memory:"
-            self._test_conn = sqlite3.connect(path, timeout=30.0)
-            self._test_conn.execute("PRAGMA foreign_keys=ON;")
-            self._test_conn.row_factory = sqlite3.Row
+        if self.test_mode or (not has_worker_binding and not has_rest_credentials):
+            allow_local_test = (
+                self.test_mode
+                or bool(test_db_path)
+                or os.getenv("CF_D1_TEST_MODE", "0") == "1"
+                or os.getenv("DEV_TEST_MODE", "false").lower() == "true"
+                or os.getenv("TESTING") == "1"
+                or "PYTEST_CURRENT_TEST" in os.environ
+            )
+            if allow_local_test and not is_worker and not in_prod:
+                path = test_db_path or ":memory:"
+                self._test_conn = sqlite3.connect(path, timeout=30.0)
+                self._test_conn.execute("PRAGMA foreign_keys=ON;")
+                self._test_conn.row_factory = sqlite3.Row
+            else:
+                raise RuntimeError(
+                    "Cloudflare D1 requires valid credentials (CF_ACCOUNT_ID, CF_D1_DATABASE_ID, CF_API_TOKEN), "
+                    "an active worker environment with 'DB' binding, or explicit non-worker test_mode=True."
+                )
 
     def prepare(self, sql: str) -> D1PreparedStatement:
         return D1PreparedStatement(self, sql)
